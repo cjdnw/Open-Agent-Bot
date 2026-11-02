@@ -104,4 +104,13 @@ describe("autoDecision", () => {
   it("never lets always-allow override the destructive guard", () => {
     expect(autoDecision({ alwaysAllow: ["Bash"] }, "Bash", "sudo rm -rf /var")).toBeNull();
   });
+
+  it("grants only the precise agents list_bots key, not shell or ask_bot", () => {
+    const bot = { alwaysAllow: ["mcp__agents__list_bots"] };
+    expect(autoDecision(bot, "mcp__agents__list_bots", 'Allow the agents MCP server to run tool "list_bots"?')).toBeTruthy();
+    expect(autoDecision(bot, "list_bots", "list bots")).toBeTruthy();
+    expect(autoDecision(bot, "mcp__agents__ask_bot", "ask QA")).toBeNull();
+    expect(autoDecision(bot, "shell", "pwsh -Command Get-Date")).toBeNull();
+    expect(autoDecision(bot, "Bash", "rm -rf scratch")).toBeNull();
+  });
 });

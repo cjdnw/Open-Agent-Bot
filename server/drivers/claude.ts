@@ -314,6 +314,13 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
         mcpServers.agents = { ...turn.integrations.agents };
         allowed.push("mcp__agents");
       }
+      for (const [name, config] of Object.entries(turn.integrations?.mcpServers ?? {})) {
+        if (!config?.command) continue;
+        if (name === "computer" || name === "agents" || name === "composio" || name === "ogb") continue;
+        if (mcpServers[name]) continue;
+        mcpServers[name] = { ...config };
+        allowed.push(`mcp__${name}`);
+      }
       // permission broker: anything acceptEdits would silently deny becomes
       // an Allow/Deny card in chat, and the agent gets ask_user. Skipped in
       // bypassPermissions (fullAuto) — nothing would ever ask.

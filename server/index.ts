@@ -14,12 +14,29 @@ import * as box from "./box.ts";
 import { cloudComputerLeases } from "./cloud-computer-pool.ts";
 import * as composio from "./composio.ts";
 import { chiefOfStaffSystemPrompt } from "./chief-of-staff.ts";
-import { ensureDirs, instanceConfigs, loadConfig, saveConfig, EVENTS_DIR, NATIVE_DIR } from "./config.ts";
+import { ensureDirs, instanceConfigs, loadConfig, saveConfig, DATA_DIR, EVENTS_DIR, NATIVE_DIR } from "./config.ts";
 import { resetPathCache } from "./env-path.ts";
 import type { ReasoningEffort, RuntimeEvent } from "./contracts.ts";
 import { discoverModels, saveDiscoveredModels, type RelaySection } from "./models-discover.ts";
-import { parseReasoningEffort } from "./reasoning.ts";
+import {
+  parseReasoningEffort,
+  providerSupportsEffort,
+  providerSupportsXHigh,
+} from "./reasoning.ts";
+import {
+  buildAttemptPlan,
+  classifyFailure,
+  isRetryableFailure,
+  nextAfterFailure,
+  normalizeRouting,
+  resolveEffort,
+  resolveFinalFallbackPolicy,
+  type FinalFallbackPolicy,
+  type ModelCandidate,
+} from "./model-fallback.ts";
 import { shouldUseCloudComputer } from "./turn-computer.ts";
+import { turnLifecycle } from "./turn-lifecycle.ts";
+import { workspaceKnowledgePrompt } from "./workspace-knowledge.ts";
 
 import { BUILT_IN_DRIVERS } from "./drivers/builtIn.ts";
 import { EventBus } from "./harness/bus.ts";
@@ -49,6 +66,34 @@ await registry.load(instanceConfigs(cfg));
 
 const bus = new EventBus();
 bus.attach(registry.instances());
+
+/** Threads currently mid-fallback: turn.completed must not clear busy yet. */
+const pendingFallbackThreads = new Set<string>();
+
+/** Instance currently driving a thread (primary or active Fallback attempt).
+ * Permission answers MUST go back to this adapter — never the permanent
+ * modelSelection alone — or a Fallback turn's request is answered on the
+ * wrong provider and the live elicitation times out / is treated as reject. */
+const activeInstanceByThread = new Map<string, string>();
+
+function adapterForThread(bot: { threadId: string; modelSelection: { instanceId: string } }) {
+  const instanceId = activeInstanceByThread.get(bot.threadId) ?? bot.modelSelection.instanceId;
+  return { instanceId, instance: registry.get(instanceId) };
+}
+
+/** Wait for the active provider Attempt (not the whole Fallback chain). */
+function waitForTurnOutcome(threadId: string, timeoutMs = 4 * 60_000) {
+  return turnLifecycle.waitForActiveAttempt(bus.subscribe.bind(bus), threadId, {
+    timeoutMs,
+    onTimeout: async () => {
+      const { instance } = adapterForThread({
+        threadId,
+        modelSelection: { instanceId: activeInstanceByThread.get(threadId) ?? "" },
+      });
+      await instance?.adapter.interruptTurn(threadId).catch(() => {});
+    },
+  });
+}
 
 // ── peer-agent comms wiring ────────────────────────────────────────────
 // A shared secret guards the localhost-only /api/internal endpoints the
@@ -80,36 +125,68 @@ function agentsIntegration(botId: string, depth: number) {
   };
 }
 
+/** Local readonly quota MCP for the lead bot. Stdio only — no listen port. */
+function quotaMcpIntegration(): { command: string; args: string[]; env: Record<string, string> } | null {
+  const script = join(DATA_DIR, "quota-report", "mcp-server.mjs");
+  if (!existsSync(script)) return null;
+  const reportDir = join(DATA_DIR, "quota-report");
+  return {
+    command: process.execPath,
+    args: [script],
+    env: {
+      ...AGENTS_NODE_FLAG,
+      QUOTA_REPORT_DIR: reportDir,
+      QUOTA_DATA_DIR: join(reportDir, "data"),
+      QUOTA_TASK_NAME: "XinyunOpen-QuotaDailyReport",
+    },
+  };
+}
+
 /** Run a turn on `targetBotId` and resolve with its assistant text — the
- * synchronous half of ask_bot. Subscribes to the bus, folds assistant_text
- * for that thread, resolves on turn.completed (or a 4-min ceiling). */
-function askBotAndWait(targetBotId: string, message: string, depth: number): Promise<string> {
+ * synchronous half of ask_bot. Waits for the LogicalTurn to finish (all
+ * Fallback attempts included), not a single provider Attempt completion. */
+async function askBotAndWait(targetBotId: string, message: string, depth: number): Promise<string> {
   const target = store.bot(targetBotId);
-  if (!target) return Promise.resolve("(no such bot)");
+  if (!target) return "(no such bot)";
   const threadId = target.threadId;
-  return new Promise((resolve) => {
-    let text = "";
-    let done = false;
-    const finish = (out: string) => {
-      if (done) return;
-      done = true;
-      clearTimeout(timer);
-      unsub();
-      resolve(out);
-    };
-    const unsub = bus.subscribe((e: RuntimeEvent) => {
-      if (e.threadId !== threadId) return;
-      if (e.type === "item.completed" && e.itemType === "assistant_text") {
-        text += (text ? "\n" : "") + e.text;
-      } else if (e.type === "turn.completed") {
-        finish(text || "(the bot finished without a text reply)");
-      }
-    });
-    const timer = setTimeout(() => finish(text || "(timed out waiting for the bot to reply)"), 4 * 60_000);
-    startTurn(targetBotId, message, { commsDepth: depth + 1 }).catch((err) =>
-      finish(`(couldn't start that bot: ${err instanceof Error ? err.message : String(err)})`),
-    );
-  });
+  if (target.busy || turnLifecycle.isBusy(threadId)) {
+    return "(that bot is busy right now — try again after it finishes)";
+  }
+  const beforeGen = turnLifecycle.get(threadId)?.generation ?? 0;
+  try {
+    await startTurn(targetBotId, message, { commsDepth: depth + 1 });
+  } catch (err) {
+    return `(couldn't start that bot: ${err instanceof Error ? err.message : String(err)})`;
+  }
+  // Poll until the logical turn for this ask is no longer active. startTurn
+  // returns when the HTTP dispatch is queued; the logical work continues async.
+  const deadline = Date.now() + 4 * 60_000;
+  while (Date.now() < deadline) {
+    const latest = store.bot(targetBotId);
+    const lt = turnLifecycle.get(threadId);
+    const busy = Boolean(latest?.busy) || turnLifecycle.isBusy(threadId);
+    if (!busy) {
+      // Prefer text folded into the logical turn; fall back to last bot messages.
+      const fromLedger = lt && lt.generation > beforeGen ? lt.finalText.trim() : "";
+      if (fromLedger) return fromLedger;
+      const path = store
+        .activePath(threadId)
+        .filter((m) => m.role === "bot" && m.kind === "text" && m.text)
+        .slice(-3)
+        .map((m) => m.text!.trim())
+        .filter(Boolean);
+      return path[path.length - 1] || "(the bot finished without a text reply)";
+    }
+    await new Promise((r) => setTimeout(r, 250));
+  }
+  // Hard ceiling: interrupt the active provider then release.
+  const { instance } = adapterForThread(target);
+  await instance?.adapter.interruptTurn(threadId).catch(() => {});
+  turnLifecycle.completeLogical(threadId, false, "ask_bot timed out");
+  store.patchBot(targetBotId, { busy: false, unread: true });
+  broadcast({ kind: "bot", bot: store.bot(targetBotId) });
+  turnLifecycle.release(threadId);
+  return "(timed out waiting for the bot to reply)";
 }
 
 // default selection for new bots: first available instance, claude preferred
@@ -212,7 +289,7 @@ bus.subscribe((event: RuntimeEvent) => {
         ? autoDecision(asker, event.tool, event.summary)
         : null;
       if (settled && asker && event.requestId) {
-        const instance = registry.get(asker.modelSelection.instanceId);
+        const { instance, instanceId } = adapterForThread(asker);
         const requestId = event.requestId;
         const { tool, summary } = event;
         // The chip is written only AFTER the provider takes the answer.
@@ -221,7 +298,7 @@ bus.subscribe((event: RuntimeEvent) => {
         // answered — and if the provider is gone entirely, forever.
         void (async () => {
           try {
-            if (!instance) throw new Error("provider unavailable");
+            if (!instance) throw new Error(`provider unavailable (${instanceId})`);
             await instance.adapter.respondToRequest(event.threadId, requestId, { behavior: "allow" });
             pushMessage({
               role: "bot",
@@ -283,9 +360,16 @@ bus.subscribe((event: RuntimeEvent) => {
       break;
     }
     case "runtime.error":
-      pushMessage({ role: "bot", kind: "activity", tool: { name: `error: ${event.message.slice(0, 160)}`, ok: false } });
+      // During fallback retries the runner owns activity messaging for switches.
+      if (!pendingFallbackThreads.has(event.threadId)) {
+        pushMessage({ role: "bot", kind: "activity", tool: { name: `error: ${event.message.slice(0, 160)}`, ok: false } });
+      }
       break;
     case "turn.completed": {
+      if (bot && pendingFallbackThreads.has(event.threadId)) {
+        // startTurn fallback loop still owns busy + finalization
+        break;
+      }
       if (bot) {
         store.patchBot(bot.id, { busy: false, unread: true });
         broadcast({ kind: "bot", bot: store.bot(bot.id) });
@@ -426,6 +510,41 @@ function readCuaConnection(): { command: string; args: string[]; env: Record<str
   return null;
 }
 
+/** Verified F_final model IDs (written at deploy / refreshed from /models). */
+function loadFinalFallbackCatalog(): {
+  ninebot: string[];
+  bailian: string[];
+} {
+  try {
+    const disk = JSON.parse(readFileSync(join(DATA_DIR, "config.json"), "utf8")) as {
+      finalFallbackPolicy?: { ninebotModel?: string; bailianModel?: string; ninebotModels?: string[] };
+    };
+    const pol = disk.finalFallbackPolicy;
+    const ninebot = [
+      ...(Array.isArray(pol?.ninebotModels) ? pol!.ninebotModels! : []),
+      ...(typeof pol?.ninebotModel === "string" ? [pol.ninebotModel] : []),
+    ].filter(Boolean);
+    const bailian = typeof pol?.bailianModel === "string" ? [pol.bailianModel] : [];
+    return { ninebot, bailian };
+  } catch {
+    return { ninebot: [], bailian: [] };
+  }
+}
+
+function loadVerifiedNinebotFlashIds(): string[] {
+  const fromDisk = loadFinalFallbackCatalog().ninebot;
+  return fromDisk.length ? fromDisk : ["external/deepseek-v4.1-flash-1017", "external/deepseek-v4.1-flash"];
+}
+
+function loadVerifiedBailianFlashIds(): string[] {
+  const fromDisk = loadFinalFallbackCatalog().bailian;
+  return fromDisk.length ? fromDisk : ["deepseek-v4.1-flash-1017"];
+}
+
+function isFinalFallbackCandidate(c: ModelCandidate, policy: FinalFallbackPolicy): boolean {
+  return policy.candidates.some((f) => f.instanceId === c.instanceId && f.model === c.model);
+}
+
 // ── turn dispatch (upstream ProviderCommandReactor, miniature) ──────────
 async function startTurn(
   botId: string,
@@ -439,10 +558,34 @@ async function startTurn(
   // a task takes its name from the first thing you asked it to do
   if (text.trim()) store.titleTaskFromFirstMessage(bot.id, text);
 
-  const instance = registry.get(bot.modelSelection.instanceId);
-  if (!instance) {
+  const routing = normalizeRouting(bot.modelRouting, bot.modelSelection);
+  const requestedEffort: ReasoningEffort =
+    opts?.reasoningEffort ??
+    (routing.defaultEffort === "xhigh" ? "xhigh" : "high");
+  // Global F_final (P6 Ninebot → P5 Bailian). Not stored on each bot — one policy for the fleet.
+  const finalPolicy: FinalFallbackPolicy = resolveFinalFallbackPolicy({
+    ninebotModelIds: loadVerifiedNinebotFlashIds(),
+    bailianModelIds: loadVerifiedBailianFlashIds(),
+  });
+  const { plan: attemptPlan, skipped: skippedCandidates } = buildAttemptPlan(
+    routing,
+    (c) => {
+      const inst = registry.get(c.instanceId);
+      if (!inst) return { available: false, reason: `instance ${c.instanceId} unavailable` };
+      return {
+        available: true,
+        agentsMcp: inst.adapter.capabilities.agentsMcp === true,
+        computerTools: Boolean(inst.adapter.capabilities.computerMode),
+        reasoningEffort: providerSupportsEffort(c.instanceId, inst.driverKind),
+        supportsXHigh: providerSupportsXHigh(c.instanceId, inst.driverKind, c.model),
+      };
+    },
+    finalPolicy,
+  );
+  if (attemptPlan.length === 0) {
+    const why = skippedCandidates.map((s) => `${s.candidate.instanceId}/${s.candidate.model}: ${s.reason}`).join("; ");
     throw Object.assign(
-      new Error(`provider instance "${bot.modelSelection.instanceId}" is unavailable — pick another model in settings`),
+      new Error(why || `provider instance "${bot.modelSelection.instanceId}" is unavailable — pick another model in settings`),
       { status: 409 },
     );
   }
@@ -469,23 +612,17 @@ async function startTurn(
   // cleared only once the turn is actually dispatched — clearing it here
   // would cost the next attempt its history if this dispatch fails.
   const rewound = Boolean(bot.rewound);
-  const turnText =
-    rewound && instance.driverKind !== "grok" && transcript.length
-      ? [
-          "[The user rewound this conversation (edited a message or switched to another version). Everything before this point was replaced by the following history:]",
-          "",
-          ...transcript.map((m) => `${m.role === "user" ? "User" : "Assistant"}: ${m.text}`),
-          "",
-          "[Now reply to the user's latest message:]",
-          "",
-          text,
-        ].join("\n")
-      : text;
 
+  const judgeFinalGuard =
+    bot.name === "Judge"
+      ? "Regardless of which model is executing this turn (including F_final), you may only answer with PASS, FAIL, or BLOCKED. Do not relax acceptance criteria when premium models are unavailable. If evidence is insufficient, return BLOCKED."
+      : "";
   const persona = [
     `You are ${bot.name}, a personal bot in XinyunOpen Bot.`,
     bot.title && `Role: ${bot.title}.`,
     bot.description && `About: ${bot.description}`,
+    judgeFinalGuard,
+    workspaceKnowledgePrompt(),
   ]
     .filter(Boolean)
     .join(" ");
@@ -495,143 +632,280 @@ async function startTurn(
   // hang the HTTP request
   store.patchBot(bot.id, { busy: true, unread: false });
   broadcast({ kind: "bot", bot: store.bot(bot.id) });
+  turnLifecycle.begin(bot.id, bot.threadId);
+  if (routing.enabled && attemptPlan.length > 1) pendingFallbackThreads.add(bot.threadId);
 
   void (async () => {
+    let lastError = "";
+    let attemptIndex = 0;
+    let logicalOk = false;
     try {
-      const integrations: NonNullable<Parameters<typeof instance.adapter.sendTurn>[0]["integrations"]> = {};
-      if (cfg.composio?.key) integrations.composio = { key: cfg.composio.key, url: cfg.composio.url };
-      const wants = bot.computer; // 'cloud' | 'local' | 'off' | undefined(auto)
-      // Capability, not provider name, decides whether this exact engine can
-      // work through a cloud computer. `native` runs the whole turn on Box;
-      // `mcp` mounts the provider-neutral computer proxy.
-      const computerMode = instance.adapter.capabilities.computerMode;
-      if (wants === "cloud" && !computerMode) {
-        throw new Error("当前模型仅支持对话/本地编程，不能操作云端电脑；请切换到标有“支持云端工作”的模型");
-      }
-      let previewBoxId: string | null = null;
-      let cloudFailure: Error | null = null;
-      if (shouldUseCloudComputer(wants, computerMode, commsDepth)) {
-        if (!box.boxConfigured(cfg)) {
-          if (wants === "cloud") throw new Error("尚未配置 Box 令牌，无法启动云端电脑");
-        } else {
-          try {
-            broadcast({ kind: "computer", botId: bot.id, state: "checking" });
-            let b = await box.findBox(cfg, bot.id).catch(() => null);
-            if (!b) {
-              await box.provisionBox(cfg, bot.id, bot.name, (state) =>
-                broadcast({ kind: "computer", botId: bot.id, state }),
-              );
-              b = await box.findBox(cfg, bot.id).catch(() => null);
-            }
-            if (!b) throw new Error("云端电脑创建后仍无法解析，请稍后重试");
-            if (!["idle", "ready", "running"].includes(b.state)) {
-              broadcast({ kind: "computer", botId: bot.id, state: "waking" });
-              b = (await box.readyBox(cfg, bot.id).catch(() => null)) ?? b;
-            }
-            if (!["idle", "ready", "running"].includes(b.state)) {
-              throw new Error(`云端电脑当前状态为 ${b.state ?? "unknown"}，未能进入可工作状态`);
-            }
-            previewBoxId = b.id;
-            integrations.computer = { boxId: b.id, token: cfg.box!.token! };
-          } catch (error) {
-            cloudFailure = error instanceof Error ? error : new Error(String(error));
-            if (wants === "cloud") throw cloudFailure;
-          }
+      while (attemptIndex < attemptPlan.length) {
+        const candidate: ModelCandidate = attemptPlan[attemptIndex]!;
+        const instance = registry.get(candidate.instanceId);
+        if (!instance) {
+          lastError = `instance ${candidate.instanceId} unavailable`;
+          const nxt = nextAfterFailure(attemptPlan, attemptIndex, "service_unavailable", routing.cooldownPolicy);
+          if (nxt.nextIndex == null) break;
+          attemptIndex = nxt.nextIndex;
+          continue;
         }
-      }
-      // local computer (this Mac) via the Electron-hosted cua-driver: the
-      // Electron main process owns the daemon (TCC attribution) and writes
-      // its spawn contract to cua-connection.json; the harness only reads it
-      if (!integrations.computer && computerMode === "mcp" && wants !== "off" && wants !== "cloud") {
-        const cua = readCuaConnection();
-        if (cua) integrations.localComputer = cua;
-      }
-      if (cloudFailure && !integrations.localComputer) throw cloudFailure;
-      // peer-agent comms: give a user-initiated turn the list_bots/ask_bot
-      // tools. A comms-invoked turn (depth ≥ cap) gets none — hard recursion
-      // stop, so the user's tokens can't be burned by a bot-to-bot loop.
-      // Only drivers that mount the tools get the integration (and, via the
-      // integrations.agents gate below, the prompt hint) — a bot on a driver
-      // without it must not be told about tools it cannot call. Any bot can
-      // still be the TARGET of ask_bot regardless of its driver.
-      if (
-        commsDepth < MAX_COMMS_DEPTH &&
-        instance.adapter.capabilities.agentsMcp === true &&
-        store.bots.filter((b) => b.id !== bot.id && !b.hidden).length > 0
-      ) {
-        integrations.agents = agentsIntegration(bot.id, commsDepth);
-      }
-      // @mentions in the user's message (the composer's tagging UI) become
-      // an explicit delegation nudge — the agent still does the ask_bot call
-      // itself, so the harness stays the single owner of turns/permissions
-      const tagged = integrations.agents
-        ? mentionedBots(
-            text,
-            store.bots.filter((b) => b.id !== bot.id),
-          )
-        : [];
-      const coordinationPrompt = bot.chiefOfStaff
-        ? chiefOfStaffSystemPrompt(bot.id, store.bots, Boolean(integrations.agents))
-        : integrations.agents
-          ? "你可以通过机器人协作工具与其他机器人配合：list_bots 查看可用机器人，ask_bot 向指定机器人发送任务并取得回复。"
-          : "";
+        turnLifecycle.beginAttempt(bot.threadId, candidate.instanceId, candidate.model);
 
-      if (integrations.computer) {
-        const leaseAbort = new AbortController();
-        pendingCloudLeaseByThread.set(bot.threadId, leaseAbort);
+        const turnText =
+          rewound && instance.driverKind !== "grok" && transcript.length
+            ? [
+                "[The user rewound this conversation (edited a message or switched to another version). Everything before this point was replaced by the following history:]",
+                "",
+                ...transcript.map((m) => `${m.role === "user" ? "User" : "Assistant"}: ${m.text}`),
+                "",
+                "[Now reply to the user's latest message:]",
+                "",
+                text,
+              ].join("\n")
+            : text;
+
+        const effortResolved = resolveEffort(
+          isFinalFallbackCandidate(candidate, finalPolicy) ? "high" : requestedEffort,
+          providerSupportsEffort(candidate.instanceId, instance.driverKind),
+          providerSupportsXHigh(candidate.instanceId, instance.driverKind, candidate.model),
+        );
+        if (effortResolved.note) {
+          const note = store.appendMessage(bot.threadId, {
+            role: "bot",
+            kind: "activity",
+            tool: { name: `effort: ${effortResolved.note}`, ok: true },
+          });
+          broadcast({ kind: "message", threadId: bot.threadId, message: note });
+        }
+
         try {
-          const release = await cloudComputerLeases.acquire(
-            integrations.computer.boxId,
-            () => broadcast({ kind: "computer", botId: bot.id, state: "waiting" }),
-            leaseAbort.signal,
-          );
-          cloudLeaseByThread.set(bot.threadId, release);
-          broadcast({ kind: "computer", botId: bot.id, state: "ready" });
-        } finally {
-          pendingCloudLeaseByThread.delete(bot.threadId);
+          // Bind permission/elicitation answers to THIS attempt's provider
+          // for the whole turn (including Fallback retries).
+          activeInstanceByThread.set(bot.threadId, candidate.instanceId);
+          const integrations: NonNullable<Parameters<typeof instance.adapter.sendTurn>[0]["integrations"]> = {};
+          if (cfg.composio?.key) integrations.composio = { key: cfg.composio.key, url: cfg.composio.url };
+          const wants = bot.computer;
+          const computerMode = instance.adapter.capabilities.computerMode;
+          if (wants === "cloud" && !computerMode) {
+            throw new Error("当前模型仅支持对话/本地编程，不能操作云端电脑；请切换到标有“支持云端工作”的模型");
+          }
+          let previewBoxId: string | null = null;
+          let cloudFailure: Error | null = null;
+          if (shouldUseCloudComputer(wants, computerMode, commsDepth)) {
+            if (!box.boxConfigured(cfg)) {
+              if (wants === "cloud") throw new Error("尚未配置 Box 令牌，无法启动云端电脑");
+            } else {
+              try {
+                broadcast({ kind: "computer", botId: bot.id, state: "checking" });
+                let b = await box.findBox(cfg, bot.id).catch(() => null);
+                if (!b) {
+                  await box.provisionBox(cfg, bot.id, bot.name, (state) =>
+                    broadcast({ kind: "computer", botId: bot.id, state }),
+                  );
+                  b = await box.findBox(cfg, bot.id).catch(() => null);
+                }
+                if (!b) throw new Error("云端电脑创建后仍无法解析，请稍后重试");
+                if (!["idle", "ready", "running"].includes(b.state)) {
+                  broadcast({ kind: "computer", botId: bot.id, state: "waking" });
+                  b = (await box.readyBox(cfg, bot.id).catch(() => null)) ?? b;
+                }
+                if (!["idle", "ready", "running"].includes(b.state)) {
+                  throw new Error(`云端电脑当前状态为 ${b.state ?? "unknown"}，未能进入可工作状态`);
+                }
+                previewBoxId = b.id;
+                integrations.computer = { boxId: b.id, token: cfg.box!.token! };
+              } catch (error) {
+                cloudFailure = error instanceof Error ? error : new Error(String(error));
+                if (wants === "cloud") throw cloudFailure;
+              }
+            }
+          }
+          if (!integrations.computer && computerMode === "mcp" && wants !== "off" && wants !== "cloud") {
+            const cua = readCuaConnection();
+            if (cua) integrations.localComputer = cua;
+          }
+          if (cloudFailure && !integrations.localComputer) throw cloudFailure;
+          if (
+            commsDepth < MAX_COMMS_DEPTH &&
+            instance.adapter.capabilities.agentsMcp === true &&
+            store.bots.filter((b) => b.id !== bot.id && !b.hidden).length > 0
+          ) {
+            integrations.agents = agentsIntegration(bot.id, commsDepth);
+          }
+          // Generic MCP registry (0.1.28 lacked a public one) — mount local
+          // readonly quota tools for the workspace lead bot only.
+          if (bot.chiefOfStaff) {
+            const quota = quotaMcpIntegration();
+            if (quota) {
+              integrations.mcpServers = { ...(integrations.mcpServers ?? {}), quota };
+            }
+          }
+          const tagged = integrations.agents
+            ? mentionedBots(
+                text,
+                store.bots.filter((b) => b.id !== bot.id),
+              )
+            : [];
+          const coordinationPrompt = bot.chiefOfStaff
+            ? chiefOfStaffSystemPrompt(bot.id, store.bots, Boolean(integrations.agents))
+            : integrations.agents
+              ? "你可以通过机器人协作工具与其他机器人配合：list_bots 查看可用机器人，ask_bot 向指定机器人发送任务并取得回复。"
+              : "";
+          const quotaPrompt = integrations.mcpServers?.quota
+            ? "你可以使用本机只读额度工具 get_quota_snapshot、get_quota_history、get_schedule_status 查询本地额度与 20:00 定时任务状态。这些工具不会也不应返回 API Key、Token 或 Cookie；禁止在回复中复述任何密钥材料。"
+            : "";
+
+          if (integrations.computer) {
+            const leaseAbort = new AbortController();
+            pendingCloudLeaseByThread.set(bot.threadId, leaseAbort);
+            try {
+              const release = await cloudComputerLeases.acquire(
+                integrations.computer.boxId,
+                () => broadcast({ kind: "computer", botId: bot.id, state: "waiting" }),
+                leaseAbort.signal,
+              );
+              cloudLeaseByThread.set(bot.threadId, release);
+              broadcast({ kind: "computer", botId: bot.id, state: "ready" });
+            } finally {
+              pendingCloudLeaseByThread.delete(bot.threadId);
+            }
+          }
+
+          const outcomePromise = waitForTurnOutcome(bot.threadId);
+          await instance.adapter.sendTurn({
+            threadId: bot.threadId,
+            text: turnText,
+            model: candidate.model,
+            reasoningEffort: effortResolved.effort,
+            resumeCursor: rewound ? undefined : store.activeTask(bot.id)?.resumeCursors[candidate.instanceId],
+            transcript,
+            system:
+              persona +
+              (integrations.computer && computerMode === "mcp"
+                ? " You have your own cloud computer — use the computer tools (screenshot, click, type_text, open_url, computer_exec) whenever browsing or acting on a desktop helps. Every action tool already returns the resulting screen, so don't follow one with a screenshot call, and batch predictable sequences with computer_batch."
+                : integrations.localComputer
+                  ? " You can act on the user's computer through the computer tools — take a screenshot or read the desktop state first, prefer accessibility actions over raw coordinates, and act carefully."
+                  : "") +
+              (coordinationPrompt ? ` ${coordinationPrompt}` : "") +
+              (quotaPrompt ? ` ${quotaPrompt}` : "") +
+              (tagged.length
+                ? ` The user tagged ${tagged
+                    .map((t) => `@${t.name} (ask_bot bot_id ${t.id})`)
+                    .join(" and ")} in their message — bring them in with ask_bot and fold their reply into your answer.`
+                : ""),
+            integrations,
+          });
+          if (rewound) store.patchBot(bot.id, { rewound: false, resumeCursors: {} });
+          if (previewBoxId) startScreenPoller(bot.id, previewBoxId);
+
+          const outcome = await outcomePromise;
+          if (outcome.ok) {
+            // success — clear fallback gate so turn.completed path already handled busy if not pending;
+            // we own busy when pendingFallbackThreads was set
+            logicalOk = true;
+            break;
+          }
+
+          lastError = outcome.error || "turn failed";
+          const kind = outcome.userAbort ? "user_abort" : classifyFailure(lastError);
+          if (outcome.hadSideEffects && isRetryableFailure(kind) && kind !== "user_abort") {
+            const hold = store.appendMessage(bot.threadId, {
+              role: "bot",
+              kind: "activity",
+              tool: {
+                name: `fallback-blocked: ${candidate.instanceId}/${candidate.model} failed (${kind}) but tools already ran — not re-executing`,
+                ok: false,
+              },
+            });
+            broadcast({ kind: "message", threadId: bot.threadId, message: hold });
+            break;
+          }
+          if (!routing.enabled || !isRetryableFailure(kind) || kind === "user_abort") {
+            const failure = store.appendMessage(bot.threadId, {
+              role: "bot",
+              kind: "activity",
+              tool: { name: `error: ${lastError.slice(0, 160)}`, ok: false },
+            });
+            broadcast({ kind: "message", threadId: bot.threadId, message: failure });
+            break;
+          }
+
+          const nxt = nextAfterFailure(attemptPlan, attemptIndex, kind, routing.cooldownPolicy);
+          if (nxt.nextIndex == null) {
+            const failure = store.appendMessage(bot.threadId, {
+              role: "bot",
+              kind: "activity",
+              tool: { name: `error: all fallbacks exhausted — ${lastError.slice(0, 120)}`, ok: false },
+            });
+            broadcast({ kind: "message", threadId: bot.threadId, message: failure });
+            break;
+          }
+          const nextCand = attemptPlan[nxt.nextIndex]!;
+          const phase = isFinalFallbackCandidate(nextCand, finalPolicy) ? "F_final" : "fallback";
+          const switchMsg = store.appendMessage(bot.threadId, {
+            role: "bot",
+            kind: "activity",
+            tool: {
+              name: `${phase}: ${candidate.instanceId}/${candidate.model} → ${nextCand.instanceId}/${nextCand.model} (${kind})`,
+              ok: true,
+            },
+          });
+          broadcast({ kind: "message", threadId: bot.threadId, message: switchMsg });
+          // Permanent modelSelection is intentionally NOT updated.
+          attemptIndex = nxt.nextIndex;
+          continue;
+        } catch (e) {
+          cloudLeaseByThread.get(bot.threadId)?.();
+          cloudLeaseByThread.delete(bot.threadId);
+          lastError = e instanceof Error ? e.message : String(e);
+          const kind = classifyFailure(lastError);
+          if (!routing.enabled || !isRetryableFailure(kind)) {
+            const failure = store.appendMessage(bot.threadId, {
+              role: "bot",
+              kind: "activity",
+              tool: { name: `error: ${lastError.slice(0, 160)}`, ok: false },
+            });
+            broadcast({ kind: "message", threadId: bot.threadId, message: failure });
+            break;
+          }
+          const nxt = nextAfterFailure(attemptPlan, attemptIndex, kind, routing.cooldownPolicy);
+          if (nxt.nextIndex == null) {
+            const failure = store.appendMessage(bot.threadId, {
+              role: "bot",
+              kind: "activity",
+              tool: { name: `error: all fallbacks exhausted — ${lastError.slice(0, 120)}`, ok: false },
+            });
+            broadcast({ kind: "message", threadId: bot.threadId, message: failure });
+            break;
+          }
+          const nextCand = attemptPlan[nxt.nextIndex]!;
+          const phase = isFinalFallbackCandidate(nextCand, finalPolicy) ? "F_final" : "fallback";
+          const switchMsg = store.appendMessage(bot.threadId, {
+            role: "bot",
+            kind: "activity",
+            tool: {
+              name: `${phase}: ${candidate.instanceId}/${candidate.model} → ${nextCand.instanceId}/${nextCand.model} (${kind})`,
+              ok: true,
+            },
+          });
+          broadcast({ kind: "message", threadId: bot.threadId, message: switchMsg });
+          attemptIndex = nxt.nextIndex;
         }
       }
-
-      await instance.adapter.sendTurn({
-        threadId: bot.threadId,
-        text: turnText,
-        model: bot.modelSelection.model,
-        reasoningEffort: opts?.reasoningEffort,
-        // a rewound thread never resumes the abandoned branch's session
-        // the active task's own session — another task's cursor would
-        // resume the wrong conversation and defeat the context bubble
-        resumeCursor: rewound ? undefined : store.activeTask(bot.id)?.resumeCursors[bot.modelSelection.instanceId],
-        transcript,
-        system:
-          persona +
-          (integrations.computer && computerMode === "mcp"
-            ? " You have your own cloud computer — use the computer tools (screenshot, click, type_text, open_url, computer_exec) whenever browsing or acting on a desktop helps. Every action tool already returns the resulting screen, so don't follow one with a screenshot call, and batch predictable sequences with computer_batch."
-            : integrations.localComputer
-              ? " You can act on the user's computer through the computer tools — take a screenshot or read the desktop state first, prefer accessibility actions over raw coordinates, and act carefully."
-              : "") +
-          (coordinationPrompt ? ` ${coordinationPrompt}` : "") +
-          (tagged.length
-            ? ` The user tagged ${tagged
-                .map((t) => `@${t.name} (ask_bot bot_id ${t.id})`)
-                .join(" and ")} in their message — bring them in with ask_bot and fold their reply into your answer.`
-            : ""),
-        integrations,
-      });
-      // dispatched: the rewind is spent, and the old cursors are dead
-      if (rewound) store.patchBot(bot.id, { rewound: false, resumeCursors: {} });
-      if (previewBoxId) startScreenPoller(bot.id, previewBoxId);
-    } catch (e) {
+    } finally {
+      pendingFallbackThreads.delete(bot.threadId);
+      activeInstanceByThread.delete(bot.threadId);
+      turnLifecycle.completeLogical(bot.threadId, logicalOk, logicalOk ? undefined : lastError || undefined);
+      // Ensure busy clears even when we suppressed the normal turn.completed handler.
+      const latest = store.bot(bot.id);
+      if (latest?.busy) {
+        store.patchBot(bot.id, { busy: false, unread: true });
+        broadcast({ kind: "bot", bot: store.bot(bot.id) });
+      }
       cloudLeaseByThread.get(bot.threadId)?.();
       cloudLeaseByThread.delete(bot.threadId);
-      const message = e instanceof Error ? e.message : String(e);
-      const failure = store.appendMessage(bot.threadId, {
-        role: "bot",
-        kind: "activity",
-        tool: { name: `error: ${message.slice(0, 160)}`, ok: false },
-      });
-      broadcast({ kind: "message", threadId: bot.threadId, message: failure });
-      store.patchBot(bot.id, { busy: false });
-      broadcast({ kind: "bot", bot: store.bot(bot.id) });
+      turnLifecycle.release(bot.threadId);
     }
   })();
 }
@@ -703,6 +977,7 @@ async function runGroupMemberTurn(
     `Room members: ${roster}, and ${userName} (the human).`,
     group.bulletin.trim() && `Room bulletin (shared instructions for everyone):\n${group.bulletin.trim()}`,
     `Reply as yourself, briefly and conversationally. To bring a teammate in, mention them like @Name — they'll see the conversation and respond.`,
+    workspaceKnowledgePrompt(),
   ]
     .filter(Boolean)
     .join("\n");
@@ -1099,7 +1374,8 @@ const server = createServer(async (req, res) => {
       const group = store.group(m[1]);
       if (!group) return json(res, 404, { error: "no such room" });
       const busy = group.busyBotId ? store.bot(group.busyBotId) : undefined;
-      const instance = busy ? registry.get(busy.modelSelection.instanceId) : undefined;
+      const instance = busy ? adapterForThread(busy).instance : undefined;
+      activeInstanceByThread.delete(group.threadId);
       await instance?.adapter.interruptTurn(group.threadId).catch(() => {});
       return json(res, 200, { ok: true });
     }
@@ -1130,8 +1406,26 @@ const server = createServer(async (req, res) => {
     if (m && method === "PATCH") {
       const body = await readBody(req);
       const patch: Record<string, unknown> = {};
-      for (const key of ["name", "title", "description", "notifications", "modelSelection", "unread", "computer", "color", "mascotShape", "mascotExpression", "pinned", "hidden"] as const) {
+      for (const key of ["name", "title", "description", "notifications", "modelSelection", "modelRouting", "unread", "computer", "color", "mascotShape", "mascotExpression", "pinned", "hidden"] as const) {
         if (body[key] !== undefined) patch[key] = body[key];
+      }
+      if (body.modelRouting !== undefined) {
+        if (body.modelRouting !== null && typeof body.modelRouting !== "object") {
+          return json(res, 400, { error: "modelRouting must be an object or null" });
+        }
+        const rawRouting = body.modelRouting as Record<string, unknown> | null;
+        if (rawRouting) {
+          const models = [
+            rawRouting.primary && typeof rawRouting.primary === "object"
+              ? (rawRouting.primary as { model?: string }).model
+              : undefined,
+            ...((Array.isArray(rawRouting.fallbacks) ? rawRouting.fallbacks : [])
+              .map((f) => (f && typeof f === "object" ? (f as { model?: string }).model : undefined))),
+          ].filter(Boolean) as string[];
+          if (models.some((m) => /composer-2\.5/i.test(m))) {
+            return json(res, 400, { error: "composer-2.5 is forbidden" });
+          }
+        }
       }
       if (body.chiefOfStaff !== undefined && typeof body.chiefOfStaff !== "boolean") {
         return json(res, 400, { error: "chiefOfStaff must be true or false" });
@@ -1289,8 +1583,8 @@ const server = createServer(async (req, res) => {
       const bot = store.bot(m[1]);
       if (!bot) return json(res, 404, { error: "no such bot" });
       const body = await readBody(req);
-      const instance = registry.get(bot.modelSelection.instanceId);
-      if (!instance) return json(res, 409, { error: "provider unavailable" });
+      const { instance, instanceId } = adapterForThread(bot);
+      if (!instance) return json(res, 409, { error: `provider unavailable (${instanceId})` });
       await instance.adapter.respondToRequest(bot.threadId, String(body.requestId), {
         behavior: body.behavior,
         message: body.message,
@@ -1307,8 +1601,8 @@ const server = createServer(async (req, res) => {
       const group = store.groupByThread(threadId);
       const owner = group ? (group.busyBotId ? store.bot(group.busyBotId) : undefined) : store.botByThread(threadId);
       if (!owner) return json(res, 404, { error: "nothing is waiting on an answer in this conversation" });
-      const instance = registry.get(owner.modelSelection.instanceId);
-      if (!instance) return json(res, 409, { error: "provider unavailable" });
+      const { instance, instanceId } = adapterForThread(owner);
+      if (!instance) return json(res, 409, { error: `provider unavailable (${instanceId})` });
       await instance.adapter.respondToRequest(threadId, String(body.requestId), {
         behavior: body.behavior,
         message: body.message,
@@ -1319,10 +1613,20 @@ const server = createServer(async (req, res) => {
     if (m && method === "POST") {
       const bot = store.bot(m[1]);
       if (!bot) return json(res, 404, { error: "no such bot" });
-      const instance = registry.get(bot.modelSelection.instanceId);
+      const { instance } = adapterForThread(bot);
       pendingCloudLeaseByThread.get(bot.threadId)?.abort();
       pendingCloudLeaseByThread.delete(bot.threadId);
-      await instance?.adapter.interruptTurn(bot.threadId);
+      // Always drop the fallback gate + busy flag on user interrupt so the UI
+      // does not stick on “正在连接引擎” if the provider never emits turn.completed.
+      pendingFallbackThreads.delete(bot.threadId);
+      activeInstanceByThread.delete(bot.threadId);
+      await instance?.adapter.interruptTurn(bot.threadId).catch(() => {});
+      turnLifecycle.completeLogical(bot.threadId, false, "interrupted by user");
+      if (bot.busy) {
+        store.patchBot(bot.id, { busy: false, unread: true });
+        broadcast({ kind: "bot", bot: store.bot(bot.id)! });
+      }
+      turnLifecycle.release(bot.threadId);
       return json(res, 200, { ok: true });
     }
 

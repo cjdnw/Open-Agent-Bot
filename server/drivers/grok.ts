@@ -100,6 +100,16 @@ export function agentsMcpConfig(turn: SendTurnInput): McpStdioConfig | null {
   return turn.integrations?.agents ?? null;
 }
 
+export function extraMcpConfigs(turn: SendTurnInput): McpStdioConfig[] {
+  const out: McpStdioConfig[] = [];
+  for (const [name, config] of Object.entries(turn.integrations?.mcpServers ?? {})) {
+    if (!config?.command) continue;
+    if (name === "computer" || name === "agents" || name === "composio" || name === "ogb") continue;
+    out.push(config);
+  }
+  return out;
+}
+
 function nativeRequest(body: Record<string, unknown>): Record<string, unknown> {
   const messages = Array.isArray(body.messages)
     ? body.messages.map((message: any) => ({
@@ -239,6 +249,7 @@ export const GrokDriver: ProviderDriver<GrokConfig> = {
           const mcps = [
             ...(config.computerTools ? [computerMcpConfig(turn)] : []),
             ...(config.agentTools ? [agentsMcpConfig(turn)] : []),
+            ...extraMcpConfigs(turn),
           ].filter((mcp): mcp is McpStdioConfig => mcp !== null);
           toolProvider = await connectMcpStdioMany(mcps, abort.signal);
           const { text, usage } = await runOpenAICompatibleToolLoop({

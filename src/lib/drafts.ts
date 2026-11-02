@@ -1,7 +1,7 @@
 import { useCallback, useState, type SetStateAction } from "react";
 import { isAttachment, type Attachment } from "./composer-attachments.js";
 
-export type ReasoningEffort = "low" | "medium" | "high";
+export type ReasoningEffort = "low" | "medium" | "high" | "xhigh";
 
 const TEXT_KEY = "xinyun-drafts";
 const ATTACHMENTS_KEY = "xinyun-draft-attachments";
@@ -48,7 +48,8 @@ export function getDraftAttachments(store: Store, id: string): Attachment[] {
 
 export function getReasoningEffort(store: Store, id: string): ReasoningEffort {
   const value = read(store, EFFORT_KEY)[id];
-  return value === "low" || value === "high" || value === "medium" ? value : "medium";
+  // Product default: High. Target tiers are High / XHigh; low/medium still load if previously saved.
+  return value === "low" || value === "medium" || value === "high" || value === "xhigh" ? value : "high";
 }
 
 export function useComposerDraft(

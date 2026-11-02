@@ -314,23 +314,22 @@ export function Composer({
           )}
           title={
             reasoningSupport.all
-              ? "思考模式：低更快，高更深入且耗时更长"
+              ? "思考强度：高=默认；XHigh=更强推理（仅部分引擎真实支持，不支持时会降为高并提示）"
               : reasoningSupport.any
-                ? "支持的群成员会使用所选思考模式；其他成员使用模型默认值"
+                ? "支持的群成员会使用所选思考强度；其他成员使用模型默认值"
                 : "当前模型暂不支持调整思考强度"
           }
         >
           <BrainCircuit size={13} />
           <select
-            value={reasoningEffort}
+            value={reasoningEffort === "low" || reasoningEffort === "medium" ? "high" : reasoningEffort}
             onChange={(event) => setReasoningEffort(event.target.value as ReasoningEffort)}
             disabled={!reasoningSupport.any || Boolean(approval)}
-            aria-label="思考模式"
+            aria-label="思考强度"
             className="cursor-pointer bg-transparent text-[11px] font-medium text-inherit outline-none disabled:cursor-not-allowed"
           >
-            <option value="low">低</option>
-            <option value="medium">中</option>
             <option value="high">高</option>
+            <option value="xhigh">XHigh</option>
           </select>
         </label>
         <textarea

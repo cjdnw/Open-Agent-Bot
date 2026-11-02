@@ -219,7 +219,7 @@ export interface InstanceInfo {
   };
 }
 
-export type ReasoningEffort = "low" | "medium" | "high";
+export type ReasoningEffort = "low" | "medium" | "high" | "xhigh";
 
 export type ComputerActivityState =
   | "checking"

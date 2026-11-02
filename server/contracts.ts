@@ -9,7 +9,7 @@ export type DriverKind = string;
 export type InstanceId = string;
 export type ThreadId = string;
 export type TurnId = string;
-export type ReasoningEffort = "low" | "medium" | "high";
+export type ReasoningEffort = "low" | "medium" | "high" | "xhigh";
 
 // ── model selection ────────────────────────────────────────────────────
 // "Which model" is a data value carried on the request, never a service
@@ -17,6 +17,24 @@ export type ReasoningEffort = "low" | "medium" | "high";
 export interface ModelSelection {
   instanceId: InstanceId;
   model: string;
+}
+
+/** Optional per-bot automatic fallback chain. Permanent primary stays in modelSelection. */
+export interface ModelCandidateWire {
+  instanceId: InstanceId;
+  model: string;
+  label?: string;
+  requireAgentsMcp?: boolean;
+  requireComputerTools?: boolean;
+}
+
+export interface ModelRoutingWire {
+  enabled?: boolean;
+  primary?: ModelCandidateWire;
+  fallbacks?: ModelCandidateWire[];
+  defaultEffort?: "high" | "xhigh";
+  maxAttempts?: number;
+  cooldownPolicy?: "skip_pool_on_quota" | "none";
 }
 
 // ── instance configuration envelope ────────────────────────────────────
@@ -112,6 +130,10 @@ export interface SendTurnInput {
      * through the harness so this bot can message other bots. The harness
      * owns turns, permissions, and recursion limits; the proxy only forwards. */
     agents?: { command: string; args: string[]; env: Record<string, string> };
+    /** Extra stdio MCP servers mounted for this turn (generic registry).
+     * Keys become MCP server names (e.g. quota → mcp__quota__*). Values must
+     * not embed API keys that tools could echo; prefer env-based local paths. */
+    mcpServers?: Record<string, { command: string; args: string[]; env?: Record<string, string> }>;
   };
   cwd?: string;
 }

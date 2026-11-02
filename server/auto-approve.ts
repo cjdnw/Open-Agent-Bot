@@ -73,7 +73,19 @@ export function autoDecision(bot: AutoApprover, tool: string, summary: string): 
   if (looksDestructive(summary) || looksDestructive(tool)) return null;
   if (looksSensitive(summary)) return null;
   const key = approvalKey(tool, summary);
-  if (bot.alwaysAllow?.includes(key)) return `auto-approved ${key} (always allowed)`;
+  const allow = bot.alwaysAllow ?? [];
+  // Exact key first. Also accept the Claude-style mcp__server__tool form when
+  // the driver already emitted it, and the bare tool leaf ONLY for the
+  // confirmed internal agents readonly list_bots (never bare "shell"/etc.).
+  if (allow.includes(key) || allow.includes(tool)) {
+    return `auto-approved ${key} (always allowed)`;
+  }
+  const leaf = tool.includes("__") ? tool.split("__").pop()! : tool;
+  if (leaf === "list_bots" && (tool === "list_bots" || /^mcp__agents__list_bots$/i.test(tool))) {
+    if (allow.includes("mcp__agents__list_bots") || allow.includes("list_bots")) {
+      return `auto-approved mcp__agents__list_bots (always allowed)`;
+    }
+  }
   if (bot.autoApprove) return `auto-approved ${tool}`;
   return null;
 }

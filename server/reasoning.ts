@@ -1,9 +1,35 @@
+// Shared reasoning-effort helpers. The wire form is "low" | "medium" |
+// "high" | "xhigh". Product policy for Xinyun 6-bot deploy: only high/xhigh
+// are target tiers; low/medium remain parseable for older clients.
 import type { ReasoningEffort } from "./contracts.ts";
 
-const VALUES = new Set<ReasoningEffort>(["low", "medium", "high"]);
+const ALLOWED = new Set<ReasoningEffort>(["low", "medium", "high", "xhigh"]);
 
-export function parseReasoningEffort(value: unknown): ReasoningEffort | undefined {
-  if (value === undefined || value === null || value === "") return undefined;
-  if (typeof value === "string" && VALUES.has(value as ReasoningEffort)) return value as ReasoningEffort;
-  throw Object.assign(new Error("reasoningEffort must be low, medium, or high"), { status: 400 });
+/** Parse a wire value into a ReasoningEffort, or undefined when absent/invalid. */
+export function parseReasoningEffort(raw: unknown): ReasoningEffort | undefined {
+  if (typeof raw !== "string") return undefined;
+  return ALLOWED.has(raw as ReasoningEffort) ? (raw as ReasoningEffort) : undefined;
+}
+
+/** Drivers that accept an effort parameter on turn start. */
+export function providerSupportsEffort(instanceId: string, driver?: string): boolean {
+  const id = instanceId.toLowerCase();
+  const d = (driver ?? "").toLowerCase();
+  if (id === "codex" || d === "codex") return true;
+  if (id === "deepseek-aliyun" || id === "deepseek" || id === "ninebot" || d === "grok") return true;
+  // Claude / Cursor / Antigravity: model id often embeds *-high; no separate xhigh param.
+  return false;
+}
+
+/** Whether the provider can honestly honor XHigh (not silently map to high). */
+export function providerSupportsXHigh(instanceId: string, driver?: string, model?: string): boolean {
+  const id = instanceId.toLowerCase();
+  const d = (driver ?? "").toLowerCase();
+  // Codex CLI passes effort through to turn/start — xhigh is accepted when the
+  // underlying GPT model supports it. We allow claiming xhigh for codex only.
+  if (id === "codex" || d === "codex") return true;
+  // Bailian / Ninebot OpenAI-compat: reasoning_effort may accept xhigh on some
+  // models; we do NOT claim support until verified — return false.
+  void model;
+  return false;
 }

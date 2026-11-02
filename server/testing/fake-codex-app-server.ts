@@ -4,7 +4,7 @@
 // initialize/thread/turn handshake, then plays a scripted turn. Like the
 // real app-server, it never exits on its own — the driver kills it.
 //
-//   FAKE_CODEX_MODE   happy (default) | approval | resume | stream
+//   FAKE_CODEX_MODE   happy (default) | approval | elicitation | resume | stream
 //   FAKE_CODEX_DUMP   path to write {argv, env, calls, decision} as JSON
 //
 // Keep this file dependency-free — it runs as a bare `node` subprocess.
@@ -83,6 +83,18 @@ process.stdin.on("data", (chunk) => {
         if (mode === "approval") {
           out({ jsonrpc: "2.0", id: 100, method: "execCommandApproval", params: { command: "rm -rf scratch" } });
           // turn continues from the approval response handler above
+        } else if (mode === "elicitation") {
+          out({
+            jsonrpc: "2.0",
+            id: 100,
+            method: "mcpServer/elicitation/request",
+            params: {
+              serverName: "agents",
+              message: 'Allow the agents MCP server to run tool "list_bots"?',
+              requestedSchema: { type: "object", properties: {} },
+              _meta: { codex_approval_kind: "mcp_tool_call" },
+            },
+          });
         } else {
           finishTurn();
         }

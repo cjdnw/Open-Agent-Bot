@@ -41,6 +41,27 @@ const COMPUTER_PROXY_PATH = proxyPath("computer-proxy");
 const tomlString = (value: string) => JSON.stringify(value);
 const tomlKey = (value: string) => (/^[A-Za-z0-9_-]+$/.test(value) ? value : JSON.stringify(value));
 
+/** Codex MCP elicitations name the server, not the tool. Derive a precise
+ * approval key (`mcp__agents__list_bots`) so alwaysAllow can grant one
+ * readonly agents tool without approving the whole MCP server. */
+export function mcpElicitationToolName(params: Record<string, unknown>): string {
+  const server = String(
+    params.serverName ?? ((params._meta as { serverName?: unknown } | undefined)?.serverName) ?? "mcp",
+  );
+  const meta = (params._meta && typeof params._meta === "object" ? params._meta : {}) as Record<string, unknown>;
+  const fromMeta =
+    (typeof meta.tool_name === "string" && meta.tool_name) ||
+    (typeof meta.toolName === "string" && meta.toolName) ||
+    (typeof params.toolName === "string" && params.toolName) ||
+    (typeof params.tool === "string" && params.tool) ||
+    "";
+  const message = typeof params.message === "string" ? params.message : "";
+  const quoted = message.match(/run tool\s+"([^"]+)"/i) || message.match(/run tool\s+'([^']+)'/i);
+  const toolName = fromMeta || quoted?.[1] || "";
+  if (toolName) return `mcp__${server}__${toolName}`;
+  return `mcp__${server}`;
+}
+
 function appendMcpOverrides(
   args: string[],
   name: string,
@@ -73,6 +94,12 @@ export function codexAppServerArgs(turn: SendTurnInput): string[] {
     appendMcpOverrides(args, "computer", turn.integrations.localComputer);
   }
   if (turn.integrations?.agents) appendMcpOverrides(args, "agents", turn.integrations.agents);
+  for (const [name, config] of Object.entries(turn.integrations?.mcpServers ?? {})) {
+    if (!config?.command) continue;
+    // Reserved names stay owned by first-party integrations above.
+    if (name === "computer" || name === "agents" || name === "composio" || name === "ogb") continue;
+    appendMcpOverrides(args, name, config);
+  }
   args.push("app-server");
   return args;
 }
@@ -203,24 +230,45 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         const params = msg.params ?? {};
         const legacy = method === "execCommandApproval" || method === "applyPatchApproval";
         const isQuestion = method === "item/tool/requestUserInput";
+        // Codex 0.125+ routes MCP tool approvals through elicitation. The
+        // response schema requires `action` (accept|decline|cancel). Replying
+        // with `{decision:"accept"}` fails deserialization and Codex substitutes
+        // decline → "user rejected MCP tool call" (breaks list_bots / ask_bot).
+        const isElicitation = method === "mcpServer/elicitation/request";
         const tool =
           method === "item/fileChange/requestApproval" || method === "applyPatchApproval"
             ? "edit"
             : isQuestion
               ? "ask_user"
-              : "shell";
+              : isElicitation
+                ? mcpElicitationToolName(params as Record<string, unknown>)
+                : "shell";
+        const approvalResult = (allow: boolean) => {
+          // Codex 0.125+ MCP elicitations MUST use action/content — a
+          // `{decision:"accept"}` reply deserializes as decline and surfaces
+          // as "user rejected MCP tool call".
+          if (isElicitation) {
+            return allow
+              ? { action: "accept", content: {}, _meta: null }
+              : { action: "decline", content: null, _meta: null };
+          }
+          if (legacy) return { decision: allow ? "approved" : "denied" };
+          return { decision: allow ? "accept" : "decline" };
+        };
         if (config.fullAuto && !isQuestion) {
-          return send({ jsonrpc: "2.0", id: msg.id, result: { decision: legacy ? "approved" : "accept" } });
+          return send({ jsonrpc: "2.0", id: msg.id, result: approvalResult(true) });
         }
         const requestId = newId();
         const summary =
           typeof params.command === "string"
             ? params.command.slice(0, 200)
-            : Array.isArray(params.questions)
-              ? params.questions.map((q: any) => q.question ?? q.header).filter(Boolean).join(" · ")
-              : typeof params.reason === "string"
-                ? params.reason
-                : tool;
+            : typeof params.message === "string"
+              ? params.message.slice(0, 200)
+              : Array.isArray(params.questions)
+                ? params.questions.map((q: any) => q.question ?? q.header).filter(Boolean).join(" · ")
+                : typeof params.reason === "string"
+                  ? params.reason
+                  : tool;
         const choices = isQuestion
           ? (params.questions?.[0]?.options ?? []).map((o: any) => o.label).slice(0, 5)
           : undefined;
@@ -237,7 +285,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
             send({
               jsonrpc: "2.0",
               id: msg.id,
-              result: { decision: behavior === "allow" ? (legacy ? "approved" : "accept") : legacy ? "denied" : "decline" },
+              result: approvalResult(behavior === "allow"),
             });
           }
           emit({ ...base(threadId, turnId), type: "request.resolved", requestId, behavior, source: "user" });

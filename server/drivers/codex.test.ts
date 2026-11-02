@@ -207,6 +207,42 @@ posixOnly("CodexDriver turns (fake app-server)", () => {
     expect(JSON.parse(readFileSync(dump, "utf8")).decision).toEqual({ decision: "approved" });
   });
 
+  it("auto-accepts MCP elicitations with action/content (not decision)", async () => {
+    await create({ mode: "elicitation", fullAuto: true });
+    const dump = join(scratch, "dump.json");
+    process.env.FAKE_CODEX_DUMP = dump;
+
+    await instance.adapter.sendTurn({ threadId: "t-mcp", text: "list bots" });
+    await recorder.until((e) => e.type === "turn.completed");
+
+    expect(recorder.events.some((e) => e.type === "request.opened")).toBe(false);
+    expect(JSON.parse(readFileSync(dump, "utf8")).decision).toEqual({
+      action: "accept",
+      content: {},
+      _meta: null,
+    });
+  });
+
+  it("opens MCP elicitations with a precise mcp__server__tool approval key", async () => {
+    await create({ mode: "elicitation", fullAuto: false });
+    const dump = join(scratch, "dump.json");
+    process.env.FAKE_CODEX_DUMP = dump;
+
+    await instance.adapter.sendTurn({ threadId: "t-mcp-key", text: "list bots" });
+    const opened = await recorder.until((e) => e.type === "request.opened");
+    expect(opened).toMatchObject({
+      requestType: "permission",
+      tool: "mcp__agents__list_bots",
+    });
+    await instance.adapter.respondToRequest("t-mcp-key", opened.requestId!, { behavior: "allow" });
+    await recorder.until((e) => e.type === "turn.completed");
+    expect(JSON.parse(readFileSync(dump, "utf8")).decision).toEqual({
+      action: "accept",
+      content: {},
+      _meta: null,
+    });
+  });
+
   it("rejects a second turn while one is in flight", async () => {
     await create({ mode: "approval" }); // approval mode parks the turn open
     await instance.adapter.sendTurn({ threadId: "t-busy", text: "one" });

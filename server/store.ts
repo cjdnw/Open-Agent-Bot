@@ -6,7 +6,7 @@ import { readFileSync, mkdirSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 
 import { DATA_DIR } from "./config.ts";
-import { newId, type ModelSelection, type ThreadId } from "./contracts.ts";
+import { newId, type ModelRoutingWire, type ModelSelection, type ThreadId } from "./contracts.ts";
 import { pickBotName } from "./names.ts";
 import { writeFileAtomic } from "./atomic.ts";
 
@@ -135,6 +135,8 @@ export interface BotRecord {
   mascotExpression?: MausExpression | null;
   unread: boolean;
   modelSelection: ModelSelection;
+  /** Compatible extension: automatic fallback chain. Permanent primary stays in modelSelection. */
+  modelRouting?: ModelRoutingWire;
   /** provider-native continuation per instance (e.g. claude session id) */
   resumeCursors: Record<string, unknown>;
   /** which computer the bot acts on: its cloud box, this Mac (local CUA),
@@ -284,6 +286,9 @@ export class Store {
     let chiefSeen = false;
     let groupsMigrated = false;
     for (const b of this.bots) {
+      // Always clear + persist: a crashed previous process may have left busy=true on disk,
+      // which makes the UI stick on “正在连接引擎” after relaunch if another writer reloads.
+      if (b.busy) botsMigrated = true;
       b.busy = false;
       if (!b.chiefOfStaff) continue;
       if (!chiefSeen) {

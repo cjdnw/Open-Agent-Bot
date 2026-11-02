@@ -164,22 +164,37 @@ export const CodexDriver = {
                 const params = msg.params ?? {};
                 const legacy = method === "execCommandApproval" || method === "applyPatchApproval";
                 const isQuestion = method === "item/tool/requestUserInput";
+                const isElicitation = method === "mcpServer/elicitation/request";
                 const tool = method === "item/fileChange/requestApproval" || method === "applyPatchApproval"
                     ? "edit"
                     : isQuestion
                         ? "ask_user"
-                        : "shell";
+                        : isElicitation
+                            ? String(params.serverName ?? params._meta?.codex_approval_kind ?? "mcp")
+                            : "shell";
+                const approvalResult = (allow) => {
+                    if (isElicitation) {
+                        return allow
+                            ? { action: "accept", content: {}, _meta: null }
+                            : { action: "decline", content: null, _meta: null };
+                    }
+                    if (legacy)
+                        return { decision: allow ? "approved" : "denied" };
+                    return { decision: allow ? "accept" : "decline" };
+                };
                 if (config.fullAuto && !isQuestion) {
-                    return send({ jsonrpc: "2.0", id: msg.id, result: { decision: legacy ? "approved" : "accept" } });
+                    return send({ jsonrpc: "2.0", id: msg.id, result: approvalResult(true) });
                 }
                 const requestId = newId();
                 const summary = typeof params.command === "string"
                     ? params.command.slice(0, 200)
-                    : Array.isArray(params.questions)
-                        ? params.questions.map((q) => q.question ?? q.header).filter(Boolean).join(" · ")
-                        : typeof params.reason === "string"
-                            ? params.reason
-                            : tool;
+                    : typeof params.message === "string"
+                        ? params.message.slice(0, 200)
+                        : Array.isArray(params.questions)
+                            ? params.questions.map((q) => q.question ?? q.header).filter(Boolean).join(" · ")
+                            : typeof params.reason === "string"
+                                ? params.reason
+                                : tool;
                 const choices = isQuestion
                     ? (params.questions?.[0]?.options ?? []).map((o) => o.label).slice(0, 5)
                     : undefined;
@@ -198,7 +213,7 @@ export const CodexDriver = {
                         send({
                             jsonrpc: "2.0",
                             id: msg.id,
-                            result: { decision: behavior === "allow" ? (legacy ? "approved" : "accept") : legacy ? "denied" : "decline" },
+                            result: approvalResult(behavior === "allow"),
                         });
                     }
                     emit({ ...base(threadId, turnId), type: "request.resolved", requestId, behavior, source: "user" });
