@@ -368,11 +368,54 @@ function Bubble({
   );
 }
 
+/** Backend Workflow stage events: `workflow:STAGE summary`. */
+function WorkflowStageCard({ message }: { message: Message }) {
+  const tool = message.tool;
+  if (!tool?.name.startsWith("workflow:")) return null;
+  const rest = tool.name.slice("workflow:".length).trim();
+  const stage = rest.split(/\s+/)[0] || "STAGE";
+  const summary = rest.slice(stage.length).trim() || stage;
+  const failed = tool.ok === false;
+  const done = tool.ok === true;
+  return (
+    <div className="flex justify-start">
+      <div
+        className={cn(
+          "max-w-[85%] rounded-2xl border px-3.5 py-2.5 text-[13px]",
+          failed
+            ? "border-danger/40 bg-danger/5 text-danger"
+            : done
+              ? "border-success/30 bg-success/5 text-ink"
+              : "border-accent/30 bg-panel text-ink-secondary",
+        )}
+      >
+        <div className="mb-0.5 flex items-center gap-2 font-semibold tracking-wide">
+          {tool.ok === undefined ? (
+            <Loader2 size={13} className="animate-spin" />
+          ) : failed ? (
+            <X size={13} />
+          ) : (
+            <Check size={13} className="text-success" />
+          )}
+          <span>Workflow · {stage}</span>
+        </div>
+        <div className="text-[13px] leading-snug text-ink">{summary}</div>
+        {message.text ? (
+          <pre className="mt-2 max-h-40 overflow-auto whitespace-pre-wrap break-words rounded-lg bg-raised/60 p-2 font-mono text-[11px] text-ink-secondary">
+            {message.text.length > 1200 ? `${message.text.slice(0, 1200)}…` : message.text}
+          </pre>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
 /** A tool run: spinner while live, check/cross once settled. */
 function ActivityChip({ message }: { message: Message }) {
   const { dispatch } = useStore();
   const tool = message.tool;
   if (!tool) return null;
+  if (tool.name.startsWith("workflow:")) return <WorkflowStageCard message={message} />;
   // bot⇄bot comm chip: opens the channel where the exchange lives
   const comm = message.comm;
   if (comm) {

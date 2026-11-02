@@ -36,6 +36,14 @@ import {
 } from "./model-fallback.ts";
 import { shouldUseCloudComputer } from "./turn-computer.ts";
 import { turnLifecycle } from "./turn-lifecycle.ts";
+import {
+  cancelWorkflow,
+  getActiveWorkflowForMomo,
+  isJudgeBotName,
+  startWorkflow,
+  workflowBlocksAskBot,
+  type WorkflowDeps,
+} from "./workflow-orchestrator.ts";
 import { workspaceKnowledgePrompt } from "./workspace-knowledge.ts";
 
 import { BUILT_IN_DRIVERS } from "./drivers/builtIn.ts";
@@ -187,6 +195,93 @@ async function askBotAndWait(targetBotId: string, message: string, depth: number
   broadcast({ kind: "bot", bot: store.bot(targetBotId) });
   turnLifecycle.release(threadId);
   return "(timed out waiting for the bot to reply)";
+}
+
+function workflowDeps(): WorkflowDeps {
+  return {
+    findBotByName: (name) =>
+      store.bots.find((b) => b.name.toLowerCase() === name.toLowerCase() && !b.hidden),
+    findBotById: (id) => store.bot(id),
+    listVisibleTeam: (exceptId) =>
+      store.bots.filter((b) => b.id !== exceptId && !b.hidden).map((b) => ({
+        id: b.id,
+        name: b.name,
+        title: b.title,
+        busy: b.busy,
+      })),
+    canXHighForBot: (botId) => {
+      const bot = store.bot(botId);
+      if (!bot) return false;
+      const inst = registry.get(bot.modelSelection.instanceId);
+      return providerSupportsXHigh(bot.modelSelection.instanceId, inst?.driverKind, bot.modelSelection.model);
+    },
+    setBusy: (botId, busy) => {
+      const bot = store.bot(botId);
+      if (!bot) return;
+      store.patchBot(botId, { busy, unread: !busy });
+      broadcast({ kind: "bot", bot: store.bot(botId)! });
+    },
+    postText: (threadId, text) => {
+      const msg = store.appendMessage(threadId, { role: "bot", kind: "text", text });
+      broadcast({ kind: "message", threadId, message: msg });
+    },
+    postWorkflowEvent: (threadId, event) => {
+      const label = `workflow:${event.stage} ${event.summary}`.slice(0, 220);
+      const note = store.appendMessage(threadId, {
+        role: "bot",
+        kind: "activity",
+        tool: { name: label, ok: event.ok },
+        text: event.detail ? JSON.stringify(event.detail).slice(0, 4000) : undefined,
+      });
+      broadcast({ kind: "message", threadId, message: note });
+    },
+    runBotTurn: async (botId, prompt, opts) => {
+      const bot = store.bot(botId);
+      if (!bot) return { ok: false, text: "", error: "no such bot" };
+      // Workflow holds Momo busy for the whole run; clear before nested turns.
+      if (bot.busy) {
+        store.patchBot(botId, { busy: false });
+        broadcast({ kind: "bot", bot: store.bot(botId)! });
+      }
+      const effort = opts?.reasoningEffort;
+      try {
+        await startTurn(botId, prompt, {
+          commsDepth: 0,
+          reasoningEffort: effort === "xhigh" ? "xhigh" : effort === "high" ? "high" : undefined,
+        });
+      } catch (err) {
+        return { ok: false, text: "", error: err instanceof Error ? err.message : String(err) };
+      }
+      const threadId = bot.threadId;
+      const deadline = Date.now() + 4 * 60_000;
+      while (Date.now() < deadline) {
+        const latest = store.bot(botId);
+        if (!latest?.busy && !turnLifecycle.isBusy(threadId)) {
+          const path = store
+            .activePath(threadId)
+            .filter((m) => m.role === "bot" && m.kind === "text" && m.text)
+            .map((m) => m.text!.trim())
+            .filter(Boolean);
+          const text = path[path.length - 1] || "";
+          const failed = /^(\(couldn't|\(timed out|\(no such)/i.test(text);
+          // Keep Momo marked busy while its workflow is still active.
+          const momoWf = [...store.bots].find((b) => b.chiefOfStaff && getActiveWorkflowForMomo(b.id));
+          if (momoWf) {
+            store.patchBot(momoWf.id, { busy: true, unread: false });
+            broadcast({ kind: "bot", bot: store.bot(momoWf.id)! });
+          }
+          return { ok: !failed && Boolean(text), text, error: failed ? text : undefined };
+        }
+        await new Promise((r) => setTimeout(r, 250));
+      }
+      const { instance } = adapterForThread(bot);
+      await instance?.adapter.interruptTurn(threadId).catch(() => {});
+      turnLifecycle.completeLogical(threadId, false, "workflow turn timed out");
+      store.patchBot(botId, { busy: false });
+      turnLifecycle.release(threadId);
+      return { ok: false, text: "", error: "workflow turn timed out" };
+    },
+  };
 }
 
 // default selection for new bots: first available instance, claude preferred
@@ -1209,6 +1304,13 @@ const server = createServer(async (req, res) => {
         if (target.busy) return json(res, 200, { busy: true });
         const from = store.bot(fromBotId);
         const fromName = from?.name ?? "another bot";
+        if (from) {
+          const blocked = workflowBlocksAskBot(from.id, target.name);
+          if (blocked) return json(res, 200, { error: blocked });
+        }
+        if (from?.chiefOfStaff && isJudgeBotName(target.name) && getActiveWorkflowForMomo(from.id)) {
+          return json(res, 200, { error: "workflow scheduler owns Judge — cannot ask_bot Judge" });
+        }
 
         // the exchange is mirrored into a bot⇄bot channel: it shows up in
         // the sidebar like any room, keeps the pair's full history, and the
@@ -1526,6 +1628,20 @@ const server = createServer(async (req, res) => {
       const text = String(body.text ?? "").trim();
       if (!text) return json(res, 400, { error: "text required" });
       const reasoningEffort = parseReasoningEffort(body.reasoningEffort);
+      const bot = store.bot(m[1]);
+      if (!bot) return json(res, 404, { error: "no such bot" });
+      // Chief of Staff: dual-stage Judge workflow (backend-scheduled).
+      // Opt out with { workflow: false } for a plain chat turn.
+      if (bot.chiefOfStaff && body.workflow !== false) {
+        if (bot.busy || getActiveWorkflowForMomo(bot.id)) {
+          return json(res, 409, { error: "the bot is already working — interrupt it first" });
+        }
+        const userMessage = store.appendMessage(bot.threadId, { role: "user", kind: "text", text });
+        broadcast({ kind: "message", threadId: bot.threadId, message: userMessage });
+        store.titleTaskFromFirstMessage(bot.id, text);
+        const run = await startWorkflow(workflowDeps(), { momoBotId: bot.id, userRequest: text });
+        return json(res, 202, { ok: true, workflowRunId: run.runId });
+      }
       await startTurn(m[1], text, { reasoningEffort });
       return json(res, 202, { ok: true });
     }
@@ -1622,6 +1738,19 @@ const server = createServer(async (req, res) => {
       activeInstanceByThread.delete(bot.threadId);
       await instance?.adapter.interruptTurn(bot.threadId).catch(() => {});
       turnLifecycle.completeLogical(bot.threadId, false, "interrupted by user");
+      cancelWorkflow(workflowDeps(), bot.id, "interrupted by user");
+      // Also interrupt Judge if this Momo workflow was mid-review.
+      const judge = store.bots.find((b) => isJudgeBotName(b.name));
+      if (judge && judge.id !== bot.id) {
+        const j = adapterForThread(judge);
+        await j.instance?.adapter.interruptTurn(judge.threadId).catch(() => {});
+        turnLifecycle.completeLogical(judge.threadId, false, "interrupted with workflow");
+        turnLifecycle.release(judge.threadId);
+        if (judge.busy) {
+          store.patchBot(judge.id, { busy: false, unread: true });
+          broadcast({ kind: "bot", bot: store.bot(judge.id)! });
+        }
+      }
       if (bot.busy) {
         store.patchBot(bot.id, { busy: false, unread: true });
         broadcast({ kind: "bot", bot: store.bot(bot.id)! });

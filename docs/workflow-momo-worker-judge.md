@@ -1,22 +1,39 @@
-# Momo → Worker → Judge Workflow (v0.2.0)
+# Dual-stage Judge + Momo Workflow (v0.4.0)
 
-## Intent
+## Architecture
 
-Formalize the fleet pattern already used informally:
+```text
+User → Momo → Judge PRE_REVIEW → Momo PLAN (SELF|DELEGATE|ESCALATE)
+     → EXECUTING → Judge FINAL_REVIEW → COMPLETED | REWORK | BLOCKED | FAILED
+```
 
-1. **Momo** (Chief of Staff) receives the user goal, decomposes work, and dispatches via `ask_bot`.
-2. **Worker** bots execute scoped tasks (code, research, drafting) and return evidence.
-3. **Judge** returns only `PASS` / `FAIL` / `BLOCKED` against fixed acceptance criteria.
+- **Judge** judges difficulty/risk/acceptance **before** work, and independently reviews **after**.
+- **Momo** decides how to execute (self / delegate / escalate). Judge does not force staff assignment.
+- Backend scheduler owns stage transitions. Momo must not `ask_bot` Judge or simulate PASS/FAIL.
 
-## Logical Turn contract
+## States
 
-- One user/Momo request is one **LogicalTurn**.
-- Provider Fallback creates many **Attempts** under that LogicalTurn.
-- `ask_bot` waits for LogicalTurn completion, not a single Attempt.
-- Judge answers stay constrained even when F_final switches models.
+`CREATED → PRE_REVIEW → PLANNING → EXECUTING → FINAL_REVIEW → COMPLETED`
 
-## Out of scope for the v0.2.0 skeleton
+Also: `REWORK` (max 2), `BLOCKED`, `FAILED`, `CANCELLED`.
 
-- Inventing a second orchestration runtime beside the existing agents MCP.
-- Weakening Judge output format when premium models are unavailable.
-- Persisting Workflow runs across process restarts (see v0.3.0).
+## Rules
+
+1. No execution before successful PRE_REVIEW.
+2. Locked `acceptanceCriteria` + `criteriaVersion` bind FINAL_REVIEW.
+3. PASS must match current `artifactHash` (no stale PASS reuse).
+4. HIGH risk / `requiresUserAuthorization` forces ESCALATE.
+5. Judge unavailable → BLOCKED/FAILED, never auto-PASS.
+6. Interrupt clears workflow busy (no permanent busy).
+
+## UI
+
+Momo chat shows:
+
+1. Judge pre-review card / markdown
+2. Momo decision
+3. Execution / worker activity
+4. Judge final PASS|FAIL|BLOCKED
+5. Delivery or rework notes
+
+Events are real `workflow:*` activity messages from the server.

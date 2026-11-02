@@ -6,7 +6,18 @@ Open-Agent-Bot 基于 Electron、React 和 TypeScript。你可以像聊天联系
 
 > 本项目自 [XinyunOpenBot](https://github.com/dongpen-max/XinyunOpenBot) 迁移，并保留对 [OpenMausBot](https://github.com/milind-soni/OpenMausBot) 的 MIT 版权声明。详见 [NOTICE](./NOTICE)。本项目与 Grok Bot、xAI、OpenAI、Anthropic 或 Google 没有官方隶属关系。
 
-版本规划见 [ROADMAP.md](./ROADMAP.md)。
+版本规划见 [ROADMAP.md](./ROADMAP.md)。当前版本 **v0.4.0**。
+
+## Workflow（v0.4.0）
+
+向总管 **Momo** 发任务时，后端强制走双阶段评审：
+
+1. **Judge 前置评估**：复杂度 / 风险 / 锁定验收标准（不得默认全评 COMPLEX）
+2. **Momo 自主决策**：SELF / DELEGATE / ESCALATE（不强制委派员工）
+3. **执行**：Momo 自己干或委派 Worker
+4. **Judge 最终评审**：PASS / FAIL / BLOCKED（绑定产物哈希；FAIL 最多自动返工 2 轮）
+
+详情见 [docs/workflow-momo-worker-judge.md](./docs/workflow-momo-worker-judge.md)。普通聊天可在 API 传 `"workflow": false` 跳过。
 
 ## 主要功能（v0.1.0 起保留）
 
