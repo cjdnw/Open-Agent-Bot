@@ -1,6 +1,7 @@
 node_modules
 dist
 dist-electron
+dist-server-deploy
 *.local
 .env
 .env.*
@@ -18,3 +19,4 @@ preseed-cache.mjs
 *.7z
 上游更新报告-*.md
 上游合并完成报告-*.md
+deliverables/

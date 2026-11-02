@@ -1,7 +1,7 @@
 {
-  "name": "xinyunopen-bot",
+  "name": "open-agent-bot",
   "private": false,
-  "version": "0.1.28",
+  "version": "0.1.0",
   "type": "module",
   "main": "electron/main.mjs",
   "engines": {
@@ -50,15 +50,7 @@
     "vite": "^7.1.0",
     "vitest": "^4.1.10"
   },
-  "description": "XinyunOpen Bot — 面向中国用户的开源 Grok Bot 替代方案，默认简体中文。",
-  "author": "Dongbeibei",
-  "license": "MIT",
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/dongpen-max/XinyunOpenBot.git"
-  },
-  "homepage": "https://github.com/dongpen-max/XinyunOpenBot",
-  "bugs": {
-    "url": "https://github.com/dongpen-max/XinyunOpenBot/issues"
-  }
+  "description": "Open-Agent-Bot — multi-bot desktop agent workspace migrated from XinyunOpenBot / OpenMausBot.",
+  "author": "Open-Agent-Bot contributors",
+  "license": "MIT"
 }
