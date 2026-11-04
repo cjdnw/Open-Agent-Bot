@@ -17,6 +17,17 @@ User → Momo → Judge PRE_REVIEW → Momo PLAN (SELF|DELEGATE|ESCALATE)
 
 Also: `REWORK` (max 2), `BLOCKED`, `FAILED`, `CANCELLED`.
 
+## Collaboration switch (Momo)
+
+Persistent bot field `collaborationWorkflow` (default **on** for Chief):
+
+| Switch | Behavior |
+| --- | --- |
+| **On** | User messages enter this dual-stage Judge workflow. Momo’s **primary** is always the picker `modelSelection`; bot fallbacks + F_final still apply after that. MODERATE/COMPLEX (or a false “协作流已关闭” SELF) is coerced to **DELEGATE** to real staff bots. |
+| **Off** | Lock Momo solo: plain `startTurn`, no agents MCP (`ask_bot`/`list_bots`), solo system prompt. Uses **only** the picker `modelSelection` (no `modelRouting` chain, no F_final). Turning off cancels an active run. |
+
+UI: chat header toggle, Settings under Chief, sidebar context menu.
+
 ## Rules
 
 1. No execution before successful PRE_REVIEW.

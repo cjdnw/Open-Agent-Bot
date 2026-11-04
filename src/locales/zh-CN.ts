@@ -57,6 +57,8 @@ export const zhCN = {
     removeChief: "取消总管机器人",
     chiefNeedEngine: "请先选择支持机器人协作的引擎",
     chiefCannotHide: "请先取消或转移总管角色",
+    collabOn: "开启协作流",
+    collabOff: "关闭协作流（锁定自干）",
   },
 
   // Chat view
@@ -68,6 +70,9 @@ export const zhCN = {
     botSettings: "机器人设置",
     botComputer: "机器人的计算机",
     settingUpComputer: "正在设置此机器人的计算机…",
+    collabOn: "协作流开",
+    collabOff: "协作流关 · 自干",
+    collabToggle: "切换协作流（开=Judge 协作，关=锁定 Momo 自干）",
   },
 
   // Model picker
@@ -152,6 +157,10 @@ export const zhCN = {
     chiefNeedEngine: "选择支持机器人协作工具的引擎后，才能启用总管角色。",
     chiefHandoff: "启用后将从 {name} 转移总管角色，并把此机器人设为主要联系人。",
     chiefEnable: "将此机器人设为主要联系人，在任务需要时协调其他机器人。",
+    collaborationWorkflow: "协作流",
+    collaborationWorkflowScope: "仅总管可用",
+    collaborationWorkflowOn: "开启：走 Judge 前置评估 → Worker → 最终评审的协作调度。",
+    collaborationWorkflowOff: "关闭：锁定 Momo 自己干活，不委派、不调度 Judge。",
   },
 
   // App settings

@@ -49,8 +49,12 @@ export function momoPlanPrompt(input: {
 }): string {
   return [
     "你是总管 Momo。Judge 已完成前置评估。请自主决定怎么做，不要假装自己是 Judge，不要输出 PASS/FAIL/BLOCKED。",
+    "当前【协作流已开启】。禁止声称「协作流已关闭 / 只能自干 / 不委派」；那是错误前提。",
     "可选 decision：SELF（自己做）、DELEGATE（委派一个或多个员工）、ESCALATE（需要用户批准或补充信息）。",
-    "不要为了表现忙碌而强制委派；简单任务可以 SELF。",
+    "规则：",
+    "- SIMPLE + LOW 风险：可以 SELF。",
+    "- MODERATE / COMPLEX，或需要写代码、数据转换、部署、评测、架构设计：优先 DELEGATE，并在 delegateBotNames 填写真实员工名（如 Developer、Architect、Deploy、QA、Reporter），不要填角色长描述。",
+    "- 不要为了表现忙碌而强制委派；但也不要把本该专业员工做的活全揽给自己。",
     "不得自行降低 Judge 标记的安全风险；若 requiresUserAuthorization=true，必须 ESCALATE。",
     input.reworkRound > 0
       ? `这是第 ${input.reworkRound} 轮返工。上次 Judge FAIL 原因：${input.priorFailReason || "未说明"}。`
@@ -60,7 +64,7 @@ export function momoPlanPrompt(input: {
       {
         decision: "SELF|DELEGATE|ESCALATE",
         reason: "string",
-        delegateBotNames: ["BotName"],
+        delegateBotNames: ["Developer"],
       },
       null,
       2,
@@ -69,7 +73,7 @@ export function momoPlanPrompt(input: {
     "Judge 前置评估：",
     JSON.stringify(input.preReview, null, 2),
     "",
-    "团队：",
+    "团队（用这里的名字填 delegateBotNames）：",
     input.teamRoster,
     "",
     "用户任务：",

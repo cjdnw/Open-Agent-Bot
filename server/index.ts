@@ -13,7 +13,11 @@ import { approvalKey, autoDecision } from "./auto-approve.ts";
 import * as box from "./box.ts";
 import { cloudComputerLeases } from "./cloud-computer-pool.ts";
 import * as composio from "./composio.ts";
-import { chiefOfStaffSystemPrompt } from "./chief-of-staff.ts";
+import {
+  chiefOfStaffSystemPrompt,
+  chiefSoloSystemPrompt,
+  isCollaborationWorkflowEnabled,
+} from "./chief-of-staff.ts";
 import { ensureDirs, instanceConfigs, loadConfig, saveConfig, DATA_DIR, EVENTS_DIR, NATIVE_DIR } from "./config.ts";
 import { resetPathCache } from "./env-path.ts";
 import type { ReasoningEffort, RuntimeEvent } from "./contracts.ts";
@@ -90,7 +94,7 @@ function adapterForThread(bot: { threadId: string; modelSelection: { instanceId:
 }
 
 /** Wait for the active provider Attempt (not the whole Fallback chain). */
-function waitForTurnOutcome(threadId: string, timeoutMs = 4 * 60_000) {
+function waitForTurnOutcome(threadId: string, timeoutMs = 20 * 60_000) {
   return turnLifecycle.waitForActiveAttempt(bus.subscribe.bind(bus), threadId, {
     timeoutMs,
     onTimeout: async () => {
@@ -227,13 +231,32 @@ function workflowDeps(): WorkflowDeps {
     },
     postWorkflowEvent: (threadId, event) => {
       const label = `workflow:${event.stage} ${event.summary}`.slice(0, 220);
+      // Always set ok so the chat "active tool" indicator never latches onto
+      // a Judge stage card after the scheduler moves on (or solo mode starts).
+      const ok = event.ok === undefined ? true : event.ok;
       const note = store.appendMessage(threadId, {
         role: "bot",
         kind: "activity",
-        tool: { name: label, ok: event.ok },
+        tool: { name: label, ok },
         text: event.detail ? JSON.stringify(event.detail).slice(0, 4000) : undefined,
       });
       broadcast({ kind: "message", threadId, message: note });
+    },
+    interruptBot: async (botId) => {
+      const bot = store.bot(botId);
+      if (!bot) return;
+      const { instance } = adapterForThread(bot);
+      pendingCloudLeaseByThread.get(bot.threadId)?.abort();
+      pendingCloudLeaseByThread.delete(bot.threadId);
+      pendingFallbackThreads.delete(bot.threadId);
+      activeInstanceByThread.delete(bot.threadId);
+      await instance?.adapter.interruptTurn(bot.threadId).catch(() => {});
+      turnLifecycle.completeLogical(bot.threadId, false, "workflow cancelled");
+      turnLifecycle.release(bot.threadId);
+      if (bot.busy) {
+        store.patchBot(botId, { busy: false, unread: true });
+        broadcast({ kind: "bot", bot: store.bot(botId)! });
+      }
     },
     runBotTurn: async (botId, prompt, opts) => {
       const bot = store.bot(botId);
@@ -252,11 +275,28 @@ function workflowDeps(): WorkflowDeps {
       } catch (err) {
         return { ok: false, text: "", error: err instanceof Error ? err.message : String(err) };
       }
+      // startTurn is fire-and-forget; poll until the logical turn settles.
+      // Agentic Claude turns routinely exceed 4 minutes (many Bash/tools).
       const threadId = bot.threadId;
-      const deadline = Date.now() + 4 * 60_000;
+      const deadline = Date.now() + 45 * 60_000;
+      let clearSince: number | null = null;
       while (Date.now() < deadline) {
+        // Solo mode: abort Judge/worker wait immediately (toggle may land mid-stage).
+        const momoChief = [...store.bots].find((b) => b.chiefOfStaff);
+        if (momoChief && !isCollaborationWorkflowEnabled(momoChief)) {
+          const { instance } = adapterForThread(bot);
+          await instance?.adapter.interruptTurn(threadId).catch(() => {});
+          turnLifecycle.completeLogical(threadId, false, "collaboration disabled");
+          turnLifecycle.release(threadId);
+          store.patchBot(botId, { busy: false });
+          return { ok: false, text: "", error: "collaboration workflow disabled" };
+        }
         const latest = store.bot(botId);
-        if (!latest?.busy && !turnLifecycle.isBusy(threadId)) {
+        const stillBusy = Boolean(latest?.busy || turnLifecycle.isBusy(threadId));
+        if (stillBusy) clearSince = null;
+        else if (clearSince == null) clearSince = Date.now();
+        // Idle settle: busy cleared and stayed clear briefly.
+        if (!stillBusy && clearSince != null && Date.now() - clearSince >= 400) {
           const path = store
             .activePath(threadId)
             .filter((m) => m.role === "bot" && m.kind === "text" && m.text)
@@ -653,15 +693,39 @@ async function startTurn(
   // a task takes its name from the first thing you asked it to do
   if (text.trim()) store.titleTaskFromFirstMessage(bot.id, text);
 
-  const routing = normalizeRouting(bot.modelRouting, bot.modelSelection);
+  // Chief (Momo): always start from the picker model (modelSelection), not
+  // modelRouting.primary. Solo mode additionally disables fallbacks / F_final.
+  const isChief = Boolean(bot.chiefOfStaff);
+  const soloPinned = isChief && !isCollaborationWorkflowEnabled(bot);
+  const pickerPrimary: ModelCandidate = {
+    instanceId: bot.modelSelection.instanceId,
+    model: bot.modelSelection.model,
+    label: "picker selection",
+  };
+  const routing = soloPinned
+    ? {
+        enabled: false,
+        primary: pickerPrimary,
+        fallbacks: [] as ModelCandidate[],
+        defaultEffort: "high" as const,
+        maxAttempts: 1,
+        cooldownPolicy: "none" as const,
+      }
+    : (() => {
+        const base = normalizeRouting(bot.modelRouting, bot.modelSelection);
+        return isChief ? { ...base, primary: pickerPrimary } : base;
+      })();
   const requestedEffort: ReasoningEffort =
     opts?.reasoningEffort ??
     (routing.defaultEffort === "xhigh" ? "xhigh" : "high");
   // Global F_final (P6 Ninebot → P5 Bailian). Not stored on each bot — one policy for the fleet.
-  const finalPolicy: FinalFallbackPolicy = resolveFinalFallbackPolicy({
-    ninebotModelIds: loadVerifiedNinebotFlashIds(),
-    bailianModelIds: loadVerifiedBailianFlashIds(),
-  });
+  // Solo mode disables it so a failed pick fails loudly instead of silently hopping pools.
+  const finalPolicy: FinalFallbackPolicy = soloPinned
+    ? { enabled: false, defaultEffort: "high", candidates: [] }
+    : resolveFinalFallbackPolicy({
+        ninebotModelIds: loadVerifiedNinebotFlashIds(),
+        bailianModelIds: loadVerifiedBailianFlashIds(),
+      });
   const { plan: attemptPlan, skipped: skippedCandidates } = buildAttemptPlan(
     routing,
     (c) => {
@@ -821,7 +885,10 @@ async function startTurn(
             if (cua) integrations.localComputer = cua;
           }
           if (cloudFailure && !integrations.localComputer) throw cloudFailure;
+          const collabOn = isCollaborationWorkflowEnabled(bot);
+          const soloChief = Boolean(bot.chiefOfStaff) && !collabOn;
           if (
+            !soloChief &&
             commsDepth < MAX_COMMS_DEPTH &&
             instance.adapter.capabilities.agentsMcp === true &&
             store.bots.filter((b) => b.id !== bot.id && !b.hidden).length > 0
@@ -842,11 +909,13 @@ async function startTurn(
                 store.bots.filter((b) => b.id !== bot.id),
               )
             : [];
-          const coordinationPrompt = bot.chiefOfStaff
-            ? chiefOfStaffSystemPrompt(bot.id, store.bots, Boolean(integrations.agents))
-            : integrations.agents
-              ? "你可以通过机器人协作工具与其他机器人配合：list_bots 查看可用机器人，ask_bot 向指定机器人发送任务并取得回复。"
-              : "";
+          const coordinationPrompt = soloChief
+            ? chiefSoloSystemPrompt()
+            : bot.chiefOfStaff
+              ? chiefOfStaffSystemPrompt(bot.id, store.bots, Boolean(integrations.agents))
+              : integrations.agents
+                ? "你可以通过机器人协作工具与其他机器人配合：list_bots 查看可用机器人，ask_bot 向指定机器人发送任务并取得回复。"
+                : "";
           const quotaPrompt = integrations.mcpServers?.quota
             ? "你可以使用本机只读额度工具 get_quota_snapshot、get_quota_history、get_schedule_status 查询本地额度与 20:00 定时任务状态。这些工具不会也不应返回 API Key、Token 或 Cookie；禁止在回复中复述任何密钥材料。"
             : "";
@@ -1304,6 +1373,9 @@ const server = createServer(async (req, res) => {
         if (target.busy) return json(res, 200, { busy: true });
         const from = store.bot(fromBotId);
         const fromName = from?.name ?? "another bot";
+        if (from?.chiefOfStaff && !isCollaborationWorkflowEnabled(from)) {
+          return json(res, 200, { error: "collaboration workflow is off — Momo works solo" });
+        }
         if (from) {
           const blocked = workflowBlocksAskBot(from.id, target.name);
           if (blocked) return json(res, 200, { error: blocked });
@@ -1532,6 +1604,12 @@ const server = createServer(async (req, res) => {
       if (body.chiefOfStaff !== undefined && typeof body.chiefOfStaff !== "boolean") {
         return json(res, 400, { error: "chiefOfStaff must be true or false" });
       }
+      if (body.collaborationWorkflow !== undefined) {
+        if (typeof body.collaborationWorkflow !== "boolean") {
+          return json(res, 400, { error: "collaborationWorkflow must be true or false" });
+        }
+        patch.collaborationWorkflow = body.collaborationWorkflow;
+      }
       const existing = store.bot(m[1]);
       if (body.hidden === true && existing?.chiefOfStaff && body.chiefOfStaff !== false) {
         return json(res, 400, { error: "choose another Chief of Staff before hiding this bot" });
@@ -1580,6 +1658,11 @@ const server = createServer(async (req, res) => {
             ? store.setChiefOfStaff(null)
             : [];
       if (chiefChanges === null) return json(res, 404, { error: "no such bot" });
+      // Turning collaboration off mid-flight must stop the scheduler so
+      // the next message is a plain solo turn, not a half-finished run.
+      if (body.collaborationWorkflow === false && bot.chiefOfStaff) {
+        cancelWorkflow(workflowDeps(), bot.id, "collaboration workflow disabled");
+      }
       const changed = new Map([[bot.id, store.bot(bot.id)!]]);
       for (const changedBot of chiefChanges) changed.set(changedBot.id, changedBot);
       for (const changedBot of changed.values()) broadcast({ kind: "bot", bot: changedBot });
@@ -1630,9 +1713,9 @@ const server = createServer(async (req, res) => {
       const reasoningEffort = parseReasoningEffort(body.reasoningEffort);
       const bot = store.bot(m[1]);
       if (!bot) return json(res, 404, { error: "no such bot" });
-      // Chief of Staff: dual-stage Judge workflow (backend-scheduled).
-      // Opt out with { workflow: false } for a plain chat turn.
-      if (bot.chiefOfStaff && body.workflow !== false) {
+      // Chief + collaboration switch: dual-stage Judge workflow.
+      // Per-message opt-out: { workflow: false }. Persistent off: bot.collaborationWorkflow === false.
+      if (isCollaborationWorkflowEnabled(bot) && body.workflow !== false) {
         if (bot.busy || getActiveWorkflowForMomo(bot.id)) {
           return json(res, 409, { error: "the bot is already working — interrupt it first" });
         }
@@ -1814,7 +1897,11 @@ const server = createServer(async (req, res) => {
     // child proves it is OURS by echoing its pid (a stray dev server has
     // the same API shape but a different pid)
     if (method === "GET" && path === "/api/health") {
-      return json(res, 200, { app: "openmausbot", pid: process.pid, static: Boolean(STATIC_DIR) });
+      return json(res, 200, {
+        app: process.env.OMB_APP_NAME || "openmausbot",
+        pid: process.pid,
+        static: Boolean(STATIC_DIR),
+      });
     }
 
     // ── provider instances (model picker) ──

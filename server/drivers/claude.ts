@@ -39,14 +39,19 @@ export interface ClaudeConfig {
   models: ModelCatalog;
 }
 
-// model catalog ported from upstream packages/contracts/src/model.ts
+// Model catalog synced against local Claude Code (2.1.316+). Keep Opus 5.5
+// as default — the stock upstream list lags and drops current aliases.
 const MODELS = {
-  default: "claude-sonnet-5",
+  default: "claude-opus-5-5",
   options: [
+    { id: "claude-opus-5-5", label: "Claude Opus 5.5" },
+    { id: "claude-sonnet-5-5", label: "Claude Sonnet 5.5" },
     { id: "claude-fable-5", label: "Claude Fable 5" },
+    { id: "claude-fable-5-1", label: "Claude Fable 5.1" },
+    { id: "claude-haiku-5-5", label: "Claude Haiku 5.5" },
+    { id: "claude-haiku-4-5", label: "Claude Haiku 4.5" },
     { id: "claude-opus-5", label: "Claude Opus 5" },
     { id: "claude-sonnet-5", label: "Claude Sonnet 5" },
-    { id: "claude-haiku-4-5", label: "Claude Haiku 4.5" },
   ],
 };
 
@@ -274,6 +279,8 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       if (sessionId) args.push("--resume", sessionId);
       else args.push("--session-id", newSessionId!);
       if (turn.model) args.push("--model", turn.model);
+      // Claude Code CLI: --effort low|medium|high|xhigh|max
+      if (turn.reasoningEffort) args.push("--effort", turn.reasoningEffort);
       if (turn.system) args.push("--append-system-prompt", turn.system);
 
       // integrations → MCP servers; pre-allow their tools (a headless
@@ -520,7 +527,13 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       snapshot,
       adapter: {
         provider: DRIVER_KIND,
-        capabilities: { sessionModelSwitch: "in-session", agentsMcp: true, computerMcp: true, computerMode: "mcp" },
+        capabilities: {
+          sessionModelSwitch: "in-session",
+          agentsMcp: true,
+          computerMcp: true,
+          computerMode: "mcp",
+          reasoningEffort: true,
+        },
         sendTurn,
         interruptTurn: async (threadId) => active.get(threadId)?.stop(),
         respondToRequest: async (threadId, requestId, decision) => {

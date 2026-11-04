@@ -204,7 +204,9 @@ export class TurnLifecycle {
     threadId: string,
     opts?: { timeoutMs?: number; onTimeout?: () => void | Promise<void> },
   ): Promise<TurnOutcome> {
-    const timeoutMs = opts?.timeoutMs ?? 4 * 60_000;
+    // Idle timeout: resets whenever the agent is still producing tools/text.
+    // Agentic Claude/Codex turns commonly exceed a fixed 4-minute wall clock.
+    const timeoutMs = opts?.timeoutMs ?? 20 * 60_000;
     const turn = this.byThread.get(threadId);
     if (!turn) {
       return Promise.resolve({
@@ -223,10 +225,11 @@ export class TurnLifecycle {
       let done = false;
       let errorMsg = "";
       let userAbort = false;
+      let timer: ReturnType<typeof setTimeout> | undefined;
       const finish = (ok: boolean) => {
         if (done) return;
         done = true;
-        clearTimeout(timer);
+        if (timer) clearTimeout(timer);
         unsub();
         const latest = this.byThread.get(threadId);
         this.finishAttempt(threadId, {
@@ -243,6 +246,20 @@ export class TurnLifecycle {
           text: latest?.finalText,
         });
       };
+      const armTimer = () => {
+        if (timer) clearTimeout(timer);
+        timer = setTimeout(() => {
+          void (async () => {
+            if (!errorMsg) errorMsg = "turn timed out waiting for completion";
+            try {
+              await opts?.onTimeout?.();
+            } catch {
+              /* interrupt best-effort */
+            }
+            finish(false);
+          })();
+        }, timeoutMs);
+      };
       const unsub = subscribe((e: RuntimeEvent) => {
         if (e.threadId !== threadId) return;
         const latest = this.byThread.get(threadId);
@@ -252,6 +269,7 @@ export class TurnLifecycle {
 
         if (e.type === "turn.started" && e.turnId) {
           this.bindProviderTurn(threadId, e.turnId);
+          armTimer();
         } else if (e.type === "runtime.error") {
           errorMsg = e.message || errorMsg;
           if (/aborted|interrupted|cancelled|canceled|stopped by user/i.test(e.message)) userAbort = true;
@@ -264,25 +282,19 @@ export class TurnLifecycle {
           }
         } else if (e.type === "item.completed" && e.itemType === "tool" && e.ok) {
           this.markSideEffects(threadId);
+          armTimer();
         } else if (e.type === "item.completed" && e.itemType === "assistant_text") {
           this.appendAssistantText(threadId, e.text);
+          armTimer();
+        } else if (e.type === "item.started" || e.type === "content.delta") {
+          armTimer();
         } else if (e.type === "turn.completed") {
           if (e.ok === false && !errorMsg) errorMsg = e.stopReason || "turn failed";
           if (e.stopReason && /abort|interrupt|cancel/i.test(e.stopReason)) userAbort = true;
           finish(e.ok !== false && !errorMsg);
         }
       });
-      const timer = setTimeout(() => {
-        void (async () => {
-          if (!errorMsg) errorMsg = "turn timed out waiting for completion";
-          try {
-            await opts?.onTimeout?.();
-          } catch {
-            /* interrupt best-effort */
-          }
-          finish(false);
-        })();
-      }, timeoutMs);
+      armTimer();
     });
   }
 

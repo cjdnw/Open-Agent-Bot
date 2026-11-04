@@ -17,7 +17,9 @@ export function providerSupportsEffort(instanceId: string, driver?: string): boo
   const d = (driver ?? "").toLowerCase();
   if (id === "codex" || d === "codex") return true;
   if (id === "deepseek-aliyun" || id === "deepseek" || id === "ninebot" || d === "grok") return true;
-  // Claude / Cursor / Antigravity: model id often embeds *-high; no separate xhigh param.
+  // Claude Code CLI: `--effort <low|medium|high|xhigh|max>` (verified on 2.1.x).
+  if (id === "claude" || d === "claude" || d === "claudeagent") return true;
+  // Cursor / Antigravity: model id often embeds *-high; no separate effort param here.
   return false;
 }
 
@@ -28,6 +30,8 @@ export function providerSupportsXHigh(instanceId: string, driver?: string, model
   // Codex CLI passes effort through to turn/start — xhigh is accepted when the
   // underlying GPT model supports it. We allow claiming xhigh for codex only.
   if (id === "codex" || d === "codex") return true;
+  // Claude Code CLI documents xhigh (and max); we pass xhigh through as-is.
+  if (id === "claude" || d === "claude" || d === "claudeagent") return true;
   // Bailian / Ninebot OpenAI-compat: reasoning_effort may accept xhigh on some
   // models; we do NOT claim support until verified — return false.
   void model;

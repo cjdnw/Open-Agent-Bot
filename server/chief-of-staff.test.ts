@@ -1,30 +1,27 @@
 import { describe, expect, it } from "vitest";
+import {
+  chiefSoloSystemPrompt,
+  isCollaborationWorkflowEnabled,
+} from "./chief-of-staff.ts";
 
-import { chiefOfStaffSystemPrompt } from "./chief-of-staff.ts";
-
-describe("chiefOfStaffSystemPrompt", () => {
-  const bots = [
-    { id: "chief", name: "Atlas", title: "运营" },
-    { id: "writer", name: "Quill", title: "写作", description: "撰写简洁文案" },
-    { id: "coder", name: "Patch", title: "工程", busy: true },
-    { id: "hidden", name: "Secret", hidden: true },
-  ];
-
-  it("describes visible teammates, roles, and availability", () => {
-    const prompt = chiefOfStaffSystemPrompt("chief", bots, true);
-
-    expect(prompt).toContain("唯一的总管机器人");
-    expect(prompt).toContain("Quill — 写作：撰写简洁文案（可用）");
-    expect(prompt).toContain("Patch — 工程（正在工作）");
-    expect(prompt).not.toContain("Secret");
-    expect(prompt).not.toContain("Atlas —");
-    expect(prompt).toContain("ask_bot");
+describe("collaboration workflow switch", () => {
+  it("defaults on for chief when field is unset", () => {
+    expect(isCollaborationWorkflowEnabled({ chiefOfStaff: true })).toBe(true);
+    expect(isCollaborationWorkflowEnabled({ chiefOfStaff: true, collaborationWorkflow: true })).toBe(true);
   });
 
-  it("does not promise delegation when the engine lacks agent tools", () => {
-    const prompt = chiefOfStaffSystemPrompt("chief", bots, false);
+  it("turns off only when chief explicitly disables it", () => {
+    expect(isCollaborationWorkflowEnabled({ chiefOfStaff: true, collaborationWorkflow: false })).toBe(false);
+  });
 
-    expect(prompt).toContain("不能联系其他机器人");
-    expect(prompt).not.toContain("使用 ask_bot");
+  it("stays off for non-chief bots", () => {
+    expect(isCollaborationWorkflowEnabled({ chiefOfStaff: false, collaborationWorkflow: true })).toBe(false);
+    expect(isCollaborationWorkflowEnabled({})).toBe(false);
+  });
+
+  it("solo prompt forbids delegation language", () => {
+    const prompt = chiefSoloSystemPrompt();
+    expect(prompt).toContain("关闭「协作流」");
+    expect(prompt).toContain("不要委派");
   });
 });

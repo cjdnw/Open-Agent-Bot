@@ -9,6 +9,7 @@ import {
   ChevronRight,
   Copy,
   Crown,
+  GitBranch,
   Loader2,
   Monitor,
   Pencil,
@@ -717,6 +718,11 @@ export function ChatView({ bot }: { bot: Bot }) {
                   <Crown size={10} /> {zhCN.settings.chiefOfStaff}
                 </span>
               )}
+              {bot.chiefOfStaff && bot.collaborationWorkflow === false && (
+                <span className="flex shrink-0 items-center gap-1 rounded-full bg-raised px-1.5 py-0.5 text-[10.5px] font-medium text-ink-secondary">
+                  {zhCN.chat.collabOff}
+                </span>
+              )}
             </span>
             {workStatus && (
               <span className="flex items-center gap-1 text-[11px] font-normal text-ink-secondary" aria-live="polite">
@@ -735,6 +741,29 @@ export function ChatView({ bot }: { bot: Bot }) {
             >
               <Square size={12} className="fill-current" />
               {zhCN.chat.stop}
+            </button>
+          )}
+          {bot.chiefOfStaff && (
+            <button
+              role="switch"
+              aria-checked={bot.collaborationWorkflow !== false}
+              onClick={() =>
+                dispatch({
+                  type: "updateBot",
+                  botId: bot.id,
+                  patch: { collaborationWorkflow: bot.collaborationWorkflow === false },
+                })
+              }
+              className={cn(
+                "flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[12px] font-medium transition-colors",
+                bot.collaborationWorkflow === false
+                  ? "border-hairline/40 bg-raised/60 text-ink-secondary hover:bg-raised hover:text-ink"
+                  : "border-accent/30 bg-accent/12 text-accent hover:bg-accent/18",
+              )}
+              title={zhCN.chat.collabToggle}
+            >
+              <GitBranch size={12} />
+              {bot.collaborationWorkflow === false ? zhCN.chat.collabOff : zhCN.chat.collabOn}
             </button>
           )}
           <TaskPicker bot={bot} />

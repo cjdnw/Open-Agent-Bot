@@ -119,6 +119,8 @@ export interface Bot {
   hidden?: boolean;
   /** The workspace's single primary coordinator. */
   chiefOfStaff?: boolean;
+  /** Chief-only: dual-stage collaboration workflow. Default on when unset. */
+  collaborationWorkflow?: boolean;
   /** Optional TTS tuning for this bot. Null/undefined inherits app defaults. */
   voiceProfile?: {
     voice: string;
@@ -318,7 +320,7 @@ type Action =
       patch: Partial<
         Pick<
           Bot,
-          "name" | "title" | "description" | "notifications" | "computer" | "color" | "mascotShape" | "mascotExpression" | "pinned" | "hidden" | "chiefOfStaff" | "voiceProfile"
+          "name" | "title" | "description" | "notifications" | "computer" | "color" | "mascotShape" | "mascotExpression" | "pinned" | "hidden" | "chiefOfStaff" | "collaborationWorkflow" | "voiceProfile"
         >
       >;
     }
@@ -796,12 +798,20 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     const wrapped: React.Dispatch<Action> = (action) => {
       rawDispatch(action);
       switch (action.type) {
-        case "send":
+        case "send": {
+          const sender = stateRef.current.bots.find((b) => b.id === action.botId);
+          const workflow =
+            sender?.chiefOfStaff && sender.collaborationWorkflow === false ? false : undefined;
           api(`/api/bots/${action.botId}/messages`, {
             method: "POST",
-            body: JSON.stringify({ text: action.text, reasoningEffort: action.reasoningEffort }),
+            body: JSON.stringify({
+              text: action.text,
+              reasoningEffort: action.reasoningEffort,
+              ...(workflow === false ? { workflow: false } : {}),
+            }),
           }).catch(showError);
           break;
+        }
         case "editMessage":
           api(`/api/bots/${action.botId}/messages/${action.messageId}/edit`, {
             method: "POST",
@@ -995,6 +1005,14 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           const timers = patchTimers.current;
           const pending = timers.get(action.botId);
           const patch = { ...pending?.patch, ...action.patch };
+          // Collaboration switch must hit the server immediately — a 400ms
+          // debounce lets the next message still enter the Judge workflow.
+          if (Object.prototype.hasOwnProperty.call(action.patch, "collaborationWorkflow")) {
+            if (pending) clearTimeout(pending.timer);
+            timers.delete(action.botId);
+            api(`/api/bots/${action.botId}`, { method: "PATCH", body: JSON.stringify(patch) }).catch(showError);
+            break;
+          }
           if (pending) clearTimeout(pending.timer);
           timers.set(action.botId, {
             patch,

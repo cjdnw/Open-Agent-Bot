@@ -394,6 +394,23 @@ function BotContextMenu({ menu, onClose }: { menu: MenuState; onClose: () => voi
             hint: !bot.chiefOfStaff && !canCoordinate ? zhCN.sidebar.chiefNeedEngine : undefined,
           },
         ),
+        ...(bot.chiefOfStaff
+          ? [
+              item(
+                <Crown
+                  size={16}
+                  className={bot.collaborationWorkflow === false ? "text-ink-secondary" : "text-accent"}
+                />,
+                bot.collaborationWorkflow === false ? zhCN.sidebar.collabOn : zhCN.sidebar.collabOff,
+                () =>
+                  dispatch({
+                    type: "updateBot",
+                    botId: bot.id,
+                    patch: { collaborationWorkflow: bot.collaborationWorkflow === false },
+                  }),
+              ),
+            ]
+          : []),
         item(<FolderPlus size={16} className="text-ink-secondary" />, zhCN.sidebar.moveToSection, undefined, {
           disabled: true,
           hint: zhCN.sidebar.comingSoon,

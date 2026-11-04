@@ -6,13 +6,18 @@ import { startCua, stopCua, registerCuaIpc } from "./cua.mjs";
 import { startSpeech, stopSpeech } from "./speech.mjs";
 import { startUpdater, registerUpdaterIpc } from "./updater.mjs";
 
-app.setName("XinyunOpen Bot");
+const APP_BRAND = process.env.OMB_APP_NAME || "XinyunOpen Bot";
+const APP_DATA_NAME = process.env.OMB_APP_DATA_NAME || (APP_BRAND === "cjdnw_bot" ? "cjdnw_bot" : "openmausbot");
+app.setName(APP_BRAND);
 // Keep the existing OpenMausBot user-data directory so upgrading the branded
-// build preserves local CUA state, window data and updater state.
-const COMPAT_USER_DATA = path.join(app.getPath("appData"), "openmausbot");
+// build preserves local CUA state, window data and updater state. Forks like
+// cjdnw_bot isolate via OMB_APP_NAME / OMB_APP_DATA_NAME.
+const COMPAT_USER_DATA = path.join(app.getPath("appData"), APP_DATA_NAME);
 fs.mkdirSync(COMPAT_USER_DATA, { recursive: true });
 app.setPath("userData", COMPAT_USER_DATA);
-if (process.platform === "win32") app.setAppUserModelId("com.dongpen.xinyunopenbot");
+if (process.platform === "win32") {
+  app.setAppUserModelId(process.env.OMB_APP_USER_MODEL_ID || "com.dongpen.xinyunopenbot");
+}
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // 127.0.0.1 explicitly — vite binds IPv4; a bare "localhost" here can
@@ -57,6 +62,10 @@ async function startServerOn(port) {
       ...process.env,
       OMB_STATIC_DIR: path.join(process.resourcesPath, "ui"),
       OMB_PORT: String(port),
+      OMB_DATA_DIR:
+        process.env.OMB_DATA_DIR ||
+        (APP_BRAND === "cjdnw_bot" ? path.join(app.getPath("home"), ".cjdnw_bot") : process.env.OMB_DATA_DIR),
+      OMB_APP_NAME: process.env.OMB_APP_NAME || APP_BRAND,
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -78,7 +87,8 @@ async function startServerOn(port) {
       const res = await fetch(`http://127.0.0.1:${port}/api/health`);
       if (res.ok) {
         const body = await res.json().catch(() => null);
-        if (body?.app === "openmausbot" && body.pid === proc.pid && body.static) return proc;
+        const expectedApp = process.env.OMB_APP_NAME || (APP_BRAND === "cjdnw_bot" ? "cjdnw_bot" : "openmausbot");
+        if (body?.app === expectedApp && body.pid === proc.pid && body.static) return proc;
         break; // someone else owns this port — try the next one
       }
     } catch {
@@ -96,7 +106,11 @@ async function startServerPackaged() {
   // two passes: a quit-and-reopen relaunch can race the dying instance's
   // server during teardown — one settle-and-retry covers it
   for (let attempt = 0; attempt < 2; attempt++) {
-    for (const port of [8799, 18799, 28799]) {
+    const ports =
+      APP_BRAND === "cjdnw_bot" || process.env.OMB_APP_NAME === "cjdnw_bot"
+        ? [18899, 28899, 38899]
+        : [8799, 18799, 28799];
+    for (const port of ports) {
       const proc = await startServerOn(port);
       if (proc) {
         serverProc = proc;

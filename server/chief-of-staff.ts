@@ -41,3 +41,20 @@ export function chiefOfStaffSystemPrompt(
     roster,
   ].join("\n");
 }
+
+/** Solo mode: Chief stays the lead contact but must execute alone. */
+export function chiefSoloSystemPrompt(): string {
+  return [
+    "你是此工作区的总管机器人，但当前已关闭「协作流」。",
+    "请直接锁定自己完成用户任务：不要委派、不要假装调用其他机器人、不要声称已询问 Judge 或其他同伴。",
+    "所有正常权限与确认规则继续有效；完成后给出简洁、完整的结果。",
+  ].join("\n");
+}
+
+/** Collaboration workflow is on unless the Chief explicitly turned it off. */
+export function isCollaborationWorkflowEnabled(bot: {
+  chiefOfStaff?: boolean;
+  collaborationWorkflow?: boolean;
+}): boolean {
+  return Boolean(bot.chiefOfStaff) && bot.collaborationWorkflow !== false;
+}

@@ -45,6 +45,8 @@ export interface WorkflowDeps {
   postWorkflowEvent: (momoThreadId: string, event: WorkflowEventPayload) => void;
   postText: (momoThreadId: string, text: string) => void;
   setBusy: (botId: string, busy: boolean) => void;
+  /** Hard-stop a bot turn (Judge/Momo/worker) when collaboration is cancelled. */
+  interruptBot?: (botId: string) => Promise<void> | void;
   persistRun?: (run: WorkflowRun) => void;
 }
 
@@ -92,6 +94,85 @@ export function workflowBlocksAskBot(momoBotId: string, targetBotName: string): 
 
 function rosterLines(team: Array<{ name: string; title?: string }>): string {
   return team.map((b) => `- ${b.name}${b.title ? ` (${b.title})` : ""}`).join("\n") || "- (none)";
+}
+
+function findTeamBot(
+  deps: WorkflowDeps,
+  momoBotId: string,
+  needle: string,
+): { id: string; name: string; title?: string } | undefined {
+  const raw = needle.trim();
+  if (!raw) return undefined;
+  const byName = deps.findBotByName(raw);
+  if (byName && byName.id !== momoBotId && !isJudgeBotName(byName.name)) return byName;
+  const lower = raw.toLowerCase();
+  return deps
+    .listVisibleTeam(momoBotId)
+    .find(
+      (b) =>
+        !isJudgeBotName(b.name) &&
+        (b.name.toLowerCase() === lower ||
+          (b.title || "").toLowerCase().includes(lower) ||
+          lower.includes(b.name.toLowerCase())),
+    );
+}
+
+/** Prefer DELEGATE for non-trivial work; never honor a false "协作流已关闭" SELF. */
+export function coerceCollabPlan(
+  plan: {
+    decision: "SELF" | "DELEGATE" | "ESCALATE";
+    reason: string;
+    delegateBotNames: string[];
+    at: number;
+  },
+  pre: { complexity: string; riskLevel: string; recommendedRoles: string[] },
+  team: Array<{ name: string; title?: string }>,
+): typeof plan {
+  if (plan.decision === "ESCALATE") return plan;
+  const staff = team.filter((b) => !isJudgeBotName(b.name));
+  if (staff.length === 0) return plan;
+
+  const falseSolo = /协作流已关闭|只能自干|不委派其他|锁定自己完成|直接锁定自己/.test(plan.reason);
+  const nonTrivial =
+    pre.complexity === "MODERATE" ||
+    pre.complexity === "COMPLEX" ||
+    pre.riskLevel === "MEDIUM" ||
+    pre.riskLevel === "HIGH";
+
+  if (plan.decision === "SELF" && (falseSolo || nonTrivial)) {
+    const picks = [
+      ...plan.delegateBotNames,
+      ...pre.recommendedRoles,
+      "Developer",
+      "Architect",
+      "Deploy",
+      "QA",
+      "Reporter",
+    ]
+      .map((n) => n.trim())
+      .filter(Boolean);
+    const names: string[] = [];
+    for (const n of picks) {
+      const hit = staff.find(
+        (b) =>
+          b.name.toLowerCase() === n.toLowerCase() ||
+          (b.title || "").toLowerCase().includes(n.toLowerCase()) ||
+          n.toLowerCase().includes(b.name.toLowerCase()),
+      );
+      if (hit && !names.includes(hit.name)) names.push(hit.name);
+      if (names.length >= 2) break;
+    }
+    if (names.length === 0) names.push(staff[0]!.name);
+    return {
+      ...plan,
+      decision: "DELEGATE",
+      reason: falseSolo
+        ? `协作流已开启，覆盖错误的 SELF（原理由：${plan.reason}）`
+        : `MODERATE/COMPLEX 任务优先委派员工（原 SELF 理由：${plan.reason}）`,
+      delegateBotNames: names,
+    };
+  }
+  return plan;
 }
 
 function stageToken(run: WorkflowRun, state: WorkflowState): string {
@@ -185,6 +266,25 @@ export function cancelWorkflow(deps: WorkflowDeps, momoBotId: string, reason = "
   activeByMomo.delete(momoBotId);
   deps.setBusy(momoBotId, false);
   emit(deps, next, "CANCELLED", reason, undefined, false);
+  // Mark cancelled first, then hard-stop in-flight Judge/Momo turns.
+  // Without this, toggling「自干」only flips UI while FINAL_REVIEW keeps talking.
+  for (const id of new Set([momoBotId, run.judgeBotId])) {
+    try {
+      void deps.interruptBot?.(id);
+    } catch {
+      /* best-effort */
+    }
+  }
+  // Best-effort: also stop any other busy non-hidden teammate (delegated workers).
+  for (const peer of deps.listVisibleTeam(momoBotId)) {
+    if (peer.busy && peer.id !== run.judgeBotId) {
+      try {
+        void deps.interruptBot?.(peer.id);
+      } catch {
+        /* best-effort */
+      }
+    }
+  }
   return true;
 }
 
@@ -295,6 +395,8 @@ async function runPipeline(deps: WorkflowDeps, runId: string): Promise<void> {
         reason: `强制 ESCALATE：Judge 要求用户授权（原决策 ${plan.decision} 被覆盖）。${plan.reason}`,
       };
     }
+    // Collaboration is on for this scheduler path — keep Momo from falsely SELF'ing.
+    plan = coerceCollabPlan(plan, run.preReview!, team);
     run.plan = plan;
     save(deps, run);
     emit(deps, run, "PLAN_DONE", `Momo 决策 ${plan.decision}`, plan, true);
@@ -363,8 +465,8 @@ async function runPipeline(deps: WorkflowDeps, runId: string): Promise<void> {
           ? plan.delegateBotNames
           : run.preReview!.recommendedRoles.slice(0, 3);
       const workers = names
-        .map((n) => deps.findBotByName(n))
-        .filter((b): b is NonNullable<typeof b> => Boolean(b) && b.id !== run.momoBotId && !isJudgeBotName(b.name));
+        .map((n) => findTeamBot(deps, run.momoBotId, n))
+        .filter((b): b is NonNullable<typeof b> => Boolean(b));
       if (workers.length === 0) {
         // No workers found — Momo leads alone rather than inventing staff.
         actor = "momo";

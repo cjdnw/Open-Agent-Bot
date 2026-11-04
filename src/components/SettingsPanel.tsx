@@ -57,10 +57,12 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
         | "mascotExpression"
         | "autoApprove"
         | "chiefOfStaff"
+        | "collaborationWorkflow"
         | "voiceProfile"
       >
     >,
   ) => dispatch({ type: "updateBot", botId: bot.id, patch: p });
+  const collabOn = bot.collaborationWorkflow !== false;
   const activeState = stateForBot(bot);
   const mascotMotion = state.mascotMotion?.botId === bot.id ? state.mascotMotion : null;
   const engine = state.instances.find((instance) => instance.instanceId === bot.modelSelection.instanceId);
@@ -284,6 +286,35 @@ export function SettingsPanel({ bot }: { bot: Bot }) {
                       ? zhCN.settings.chiefHandoff.replace("{name}", currentChief.name)
                       : zhCN.settings.chiefEnable}
             </div>
+            {bot.chiefOfStaff && (
+              <div className="mt-4 flex items-center gap-3 border-t border-hairline/30 pt-3">
+                <div className="min-w-0 flex-1">
+                  <div className="text-[14px] font-medium text-ink">{zhCN.settings.collaborationWorkflow}</div>
+                  <div className="mt-0.5 text-[12px] leading-relaxed text-ink-secondary">
+                    {collabOn
+                      ? zhCN.settings.collaborationWorkflowOn
+                      : zhCN.settings.collaborationWorkflowOff}
+                  </div>
+                </div>
+                <button
+                  role="switch"
+                  aria-checked={collabOn}
+                  aria-label={zhCN.settings.collaborationWorkflow}
+                  onClick={() => patch({ collaborationWorkflow: !collabOn })}
+                  className={cn(
+                    "relative h-[26px] w-[44px] shrink-0 rounded-full transition-colors",
+                    collabOn ? "bg-accent" : "bg-raised",
+                  )}
+                >
+                  <span
+                    className={cn(
+                      "absolute top-[3px] size-5 rounded-full bg-white transition-all",
+                      collabOn ? "left-[21px]" : "left-[3px]",
+                    )}
+                  />
+                </button>
+              </div>
+            )}
           </div>
 
           <div className="flex items-center justify-between gap-4 rounded-xl bg-card p-4">

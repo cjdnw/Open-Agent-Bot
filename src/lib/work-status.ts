@@ -70,9 +70,19 @@ export function deriveWorkStatus({
     return { kind: "computer", label: computerLabels[computerActivity], detail: "云端优先策略已启用" };
   }
 
+  // workflow:* activities are stage cards from the Judge scheduler, not live
+  // tool calls. Leaving ok undefined made "FINAL_REVIEW" stick as "正在调用工具"
+  // even after collaboration was turned off / the run finished.
   const activeTool = [...messages]
     .reverse()
-    .find((message) => message.kind === "activity" && message.tool && message.tool.ok === undefined && !message.tool.name.startsWith("error:"));
+    .find(
+      (message) =>
+        message.kind === "activity" &&
+        message.tool &&
+        message.tool.ok === undefined &&
+        !message.tool.name.startsWith("error:") &&
+        !message.tool.name.startsWith("workflow:"),
+    );
   if (activeTool?.tool) {
     const computer = COMPUTER_TOOL.test(activeTool.tool.name);
     return {

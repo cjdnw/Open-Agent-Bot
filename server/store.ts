@@ -157,6 +157,12 @@ export interface BotRecord {
   hidden?: boolean;
   /** The single workspace-wide coordinator. */
   chiefOfStaff?: boolean;
+  /**
+   * Chief-only: when true/undefined, user messages run the dual-stage
+   * Judge collaboration workflow. When false, Momo works solo (no
+   * workflow scheduler, no ask_bot / list_bots).
+   */
+  collaborationWorkflow?: boolean;
   /** Optional TTS tuning for this bot. Null/undefined inherits app defaults. */
   voiceProfile?: {
     voice: string;

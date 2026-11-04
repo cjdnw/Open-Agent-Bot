@@ -39,6 +39,21 @@ describe("deriveWorkStatus", () => {
     expect(deriveWorkStatus({ bot, messages })).toMatchObject({ kind: "computer", detail: "打开网页" });
   });
 
+  it("ignores sticky workflow:* stage cards so solo turns do not look like Judge", () => {
+    const messages = [
+      {
+        id: "wf-1",
+        role: "bot",
+        kind: "activity",
+        at: Date.now(),
+        tool: { name: "workflow:FINAL_REVIEW Judge 最终评审" },
+      },
+    ] as any;
+    const status = deriveWorkStatus({ bot, messages });
+    expect(status?.kind).not.toBe("tool");
+    expect(String(status?.detail ?? "")).not.toMatch(/FINAL_REVIEW|Judge/);
+  });
+
   it("reports streaming output after tool activity settles", () => {
     const messages = [{ id: "tool-1", role: "bot", kind: "activity", at: Date.now(), tool: { name: "bash", ok: true } }] as any;
     expect(deriveWorkStatus({ bot, messages, streaming: "正在回答" })).toMatchObject({ kind: "writing", label: "正在生成回复" });
