@@ -41,9 +41,11 @@ import {
 import { shouldUseCloudComputer } from "./turn-computer.ts";
 import { turnLifecycle } from "./turn-lifecycle.ts";
 import {
+  approveWorkflow,
   cancelWorkflow,
   getActiveWorkflowForMomo,
   isJudgeBotName,
+  recoverIncompleteWorkflows,
   startWorkflow,
   workflowBlocksAskBot,
   type WorkflowDeps,
@@ -205,7 +207,7 @@ function workflowDeps(): WorkflowDeps {
   return {
     findBotByName: (name) =>
       store.bots.find((b) => b.name.toLowerCase() === name.toLowerCase() && !b.hidden),
-    findBotById: (id) => store.bot(id),
+    findBotById: (id) => store.bot(id) ?? undefined,
     listVisibleTeam: (exceptId) =>
       store.bots.filter((b) => b.id !== exceptId && !b.hidden).map((b) => ({
         id: b.id,
@@ -1539,7 +1541,12 @@ const server = createServer(async (req, res) => {
       const body = await readBody(req);
       const text = String(body.text ?? "").trim();
       if (!text) return json(res, 400, { error: "text required" });
-      const reasoningEffort = parseReasoningEffort(body.reasoningEffort);
+      let reasoningEffort: ReasoningEffort | undefined;
+      try {
+        reasoningEffort = parseReasoningEffort(body.reasoningEffort);
+      } catch (e: any) {
+        return json(res, 400, { error: e.message || "invalid reasoning effort (expected low, medium, or high)" });
+      }
       startGroupTurn(m[1], text, reasoningEffort);
       return json(res, 202, { ok: true });
     }
@@ -1710,7 +1717,12 @@ const server = createServer(async (req, res) => {
       const body = await readBody(req);
       const text = String(body.text ?? "").trim();
       if (!text) return json(res, 400, { error: "text required" });
-      const reasoningEffort = parseReasoningEffort(body.reasoningEffort);
+      let reasoningEffort: ReasoningEffort | undefined;
+      try {
+        reasoningEffort = parseReasoningEffort(body.reasoningEffort);
+      } catch (e: any) {
+        return json(res, 400, { error: e.message || "invalid reasoning effort (expected low, medium, or high)" });
+      }
       const bot = store.bot(m[1]);
       if (!bot) return json(res, 404, { error: "no such bot" });
       // Chief + collaboration switch: dual-stage Judge workflow.
@@ -1840,6 +1852,16 @@ const server = createServer(async (req, res) => {
       }
       turnLifecycle.release(bot.threadId);
       return json(res, 200, { ok: true });
+    }
+
+    m = path.match(/^\/api\/workflow\/([\w-]+)\/approve$/);
+    if (m && method === "POST") {
+      const runId = m[1];
+      const body = await readBody(req);
+      const approved = body.approved !== false;
+      const ok = await approveWorkflow(workflowDeps(), runId, approved);
+      if (!ok) return json(res, 404, { error: "no workflow awaiting approval with that id" });
+      return json(res, 200, { ok: true, approved });
     }
 
     // ── tasks: a bot's separate contexts ────────────────────────────────
@@ -2064,6 +2086,11 @@ const server = createServer(async (req, res) => {
 
 server.listen(PORT, "127.0.0.1", () => {
   console.log(`openmausbot server on http://127.0.0.1:${PORT}`);
+  try {
+    recoverIncompleteWorkflows(workflowDeps());
+  } catch (err) {
+    console.warn("Failed to recover workflows on start:", err);
+  }
 });
 
 let shutdownPromise: Promise<void> | null = null;

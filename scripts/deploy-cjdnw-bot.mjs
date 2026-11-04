@@ -73,6 +73,11 @@ function killXinyun() {
 
 function buildServer() {
   mkdirSync(WF_OUT, { recursive: true });
+  const lgOut = join(WF_OUT, "langgraph");
+  mkdirSync(lgOut, { recursive: true });
+  sh(
+    `npx -y esbuild server/langgraph/index.ts --bundle --outfile=${JSON.stringify(join(lgOut, "index.js"))} --format=esm --platform=node`,
+  );
   const files = [
     "server/workflow.ts",
     "server/workflow-prompts.ts",
@@ -196,15 +201,18 @@ Write-Output "shortcut=$($s.FullName)"
   sh(`powershell -NoProfile -ExecutionPolicy Bypass -File ${JSON.stringify(script)}`);
 }
 
-async function waitHealth(port, tries = 40) {
+async function waitAnyHealth(ports, tries = 80) {
   for (let i = 0; i < tries; i++) {
-    try {
-      const res = await fetch(`http://127.0.0.1:${port}/api/health`);
-      if (!res.ok) throw new Error("bad");
-      const body = await res.json();
-      if (body?.app === APP_NAME) return body;
-    } catch {
-      /* retry */
+    for (const port of ports) {
+      try {
+        const res = await fetch(`http://127.0.0.1:${port}/api/health`);
+        if (res.ok) {
+          const body = await res.json();
+          if (body?.app === APP_NAME) return { port, ...body };
+        }
+      } catch {
+        /* retry */
+      }
     }
     await new Promise((r) => setTimeout(r, 500));
   }
@@ -238,15 +246,21 @@ async function main() {
   if (existsSync(oldExe)) renameSync(oldExe, newExe);
   if (!existsSync(newExe)) throw new Error("exe rename failed");
 
-  if (!inPlace) {
-    console.log("patch asar…");
-    patchMainAsar(join(DEST_APP, "resources", "app.asar"));
-  }
+  console.log("patch asar…");
+  patchMainAsar(join(DEST_APP, "resources", "app.asar"));
 
   console.log("deploy server…");
   const serverDest = join(DEST_APP, "resources", "server");
   for (const name of readdirSync(WF_OUT).filter((f) => f.endsWith(".js"))) {
     copyFileSync(join(WF_OUT, name), join(serverDest, name));
+  }
+  const lgDest = join(serverDest, "langgraph");
+  mkdirSync(lgDest, { recursive: true });
+  const lgSrc = join(WF_OUT, "langgraph");
+  if (existsSync(lgSrc)) {
+    for (const name of readdirSync(lgSrc).filter((f) => f.endsWith(".js"))) {
+      copyFileSync(join(lgSrc, name), join(lgDest, name));
+    }
   }
   // Keep previously deployed helpers if present in src app.
   for (const extra of ["workspace-knowledge.js", "model-fallback.js"]) {
@@ -311,18 +325,12 @@ async function main() {
     },
   }).unref();
 
-  let health = null;
-  for (const port of PORTS) {
-    health = await waitHealth(port);
-    if (health) {
-      console.log("HEALTH_OK", { port, ...health });
-      break;
-    }
-  }
+  const health = await waitAnyHealth(PORTS, 80);
   if (!health) {
     console.error("HEALTH_FAIL — app launched but API not ready; open cjdnw_bot.lnk manually");
     process.exit(2);
   }
+  console.log("HEALTH_OK", health);
   console.log("DONE", {
     exe: newExe,
     shortcut: join(DESKTOP, "cjdnw_bot.lnk"),
