@@ -23,6 +23,7 @@ import {
   getActiveWorkflowForMomo as langgraphGetActiveWorkflowForMomo,
   loadWorkflowRun as langgraphLoadWorkflowRun,
   isJudgeBotName as langgraphIsJudgeBotName,
+  isWorkflowInfrastructureBot,
   recoverIncompleteWorkflows,
 } from "./langgraph/index.ts";
 
@@ -94,7 +95,7 @@ export function coerceCollabPlan(
   team: Array<{ name: string; title?: string }>,
 ): typeof plan {
   if (plan.decision === "ESCALATE") return plan;
-  const staff = team.filter((b) => !isJudgeBotName(b.name));
+  const staff = team.filter((b) => !isWorkflowInfrastructureBot(b.name));
   if (staff.length === 0) return plan;
 
   const falseSolo = /协作流已关闭|只能自干/.test(plan.reason);

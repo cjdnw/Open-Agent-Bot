@@ -1,6 +1,6 @@
 /**
- * Lightweight Antigravity one-shot classifier for AI Gate.
- * Uses agy print mode with gemini-3.8-flash-high only — no Bot runtime, no F_final.
+ * Lightweight Antigravity one-shot classifier for the Gate bot.
+ * Uses agy print mode with gemini-3.8-flash-low (light) — no F_final chain.
  */
 import { spawnCli, killCliTree } from "../../procs.ts";
 import { augmentedPath } from "../../env-path.ts";

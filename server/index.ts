@@ -50,6 +50,7 @@ import {
   workflowBlocksAskBot,
   type WorkflowDeps,
 } from "./workflow-orchestrator.ts";
+import { ensureGateBot } from "./langgraph/index.ts";
 import { workspaceKnowledgePrompt } from "./workspace-knowledge.ts";
 
 import { BUILT_IN_DRIVERS } from "./drivers/builtIn.ts";
@@ -205,9 +206,30 @@ async function askBotAndWait(targetBotId: string, message: string, depth: number
 
 function workflowDeps(): WorkflowDeps {
   return {
-    findBotByName: (name) =>
-      store.bots.find((b) => b.name.toLowerCase() === name.toLowerCase() && !b.hidden),
-    findBotById: (id) => store.bot(id) ?? undefined,
+    findBotByName: (name) => {
+      const b = store.bots.find((x) => x.name.toLowerCase() === name.toLowerCase() && !x.hidden);
+      if (!b) return undefined;
+      return {
+        id: b.id,
+        name: b.name,
+        title: b.title,
+        busy: b.busy,
+        threadId: b.threadId,
+        modelSelection: b.modelSelection,
+      };
+    },
+    findBotById: (id) => {
+      const b = store.bot(id);
+      if (!b) return undefined;
+      return {
+        id: b.id,
+        name: b.name,
+        title: b.title,
+        threadId: b.threadId,
+        busy: b.busy,
+        modelSelection: b.modelSelection,
+      };
+    },
     listVisibleTeam: (exceptId) =>
       store.bots.filter((b) => b.id !== exceptId && !b.hidden).map((b) => ({
         id: b.id,
@@ -2086,6 +2108,13 @@ const server = createServer(async (req, res) => {
 
 server.listen(PORT, "127.0.0.1", () => {
   console.log(`openmausbot server on http://127.0.0.1:${PORT}`);
+  try {
+    const gate = ensureGateBot(store);
+    console.log(`gate bot ready: ${gate.name} model=${gate.modelSelection.model}`);
+    broadcast({ kind: "bot", bot: store.bot(gate.id)! });
+  } catch (err) {
+    console.warn("Failed to ensure Gate bot:", err);
+  }
   try {
     recoverIncompleteWorkflows(workflowDeps());
   } catch (err) {

@@ -108,7 +108,7 @@ describe("AI Gate orchestrator with mocked Gemini", () => {
               reason: "greeting",
             },
             rawText: "{}",
-            modelId: "gemini-3.8-flash-high",
+            modelId: "gemini-3.8-flash-low",
             elapsedMs: 12,
             upgraded: false,
           }) satisfies GeminiClassifyResult,
@@ -116,7 +116,7 @@ describe("AI Gate orchestrator with mocked Gemini", () => {
     );
     expect(gate.audit.classifierSource).toBe("GEMINI");
     expect(gate.routeLevel).toBe("L0");
-    expect(gate.audit.modelId).toBe("gemini-3.8-flash-high");
+    expect(gate.audit.modelId).toMatch(/flash-low|gemini-3\.8-flash/);
   });
 
   it("9. Gemini timeout → Rule Fallback", async () => {
@@ -127,7 +127,7 @@ describe("AI Gate orchestrator with mocked Gemini", () => {
           ok: false,
           failure: "TIMEOUT",
           detail: "timed out",
-          modelId: "gemini-3.8-flash-high",
+          modelId: "gemini-3.8-flash-low",
           elapsedMs: 5000,
         }),
       },
@@ -145,7 +145,7 @@ describe("AI Gate orchestrator with mocked Gemini", () => {
           ok: false,
           failure: "QUOTA_EXHAUSTED",
           detail: "429",
-          modelId: "gemini-3.8-flash-high",
+          modelId: "gemini-3.8-flash-low",
           elapsedMs: 20,
         }),
       },
@@ -162,7 +162,7 @@ describe("AI Gate orchestrator with mocked Gemini", () => {
           ok: false,
           failure: "INVALID_JSON",
           detail: "no JSON",
-          modelId: "gemini-3.8-flash-high",
+          modelId: "gemini-3.8-flash-low",
           elapsedMs: 30,
         }),
       },

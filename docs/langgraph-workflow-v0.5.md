@@ -53,13 +53,14 @@ Existing `workflow:*` stage cards in ChatView show Fast Gate / Pre-Review / Plan
 
 `server/langgraph/langgraph-workflow.test.ts` — Fast Gate matrix, Judge pre/final, SELF/DELEGATE edges, rework cap, cancel, interrupt/resume, 100× mock L0/L1 stress.
 
-## AI Gate (Gemini 3.8 Flash High + Rule Fallback)
+## AI Gate Bot (Gemini 3.8 Flash Low + Rule Fallback)
 
-- Primary: Antigravity `gemini-3.8-flash-high` via lightweight `agy --print` (no Bot F_final, no tool execution).
-- Fallback: deterministic `server/langgraph/gate/rule-fallback.ts` (also `server/workflow/gate/rule-fallback.ts`).
-- Config: `OMB_AI_GATE_ENABLED` (default true), `OMB_AI_GATE_TIMEOUT_MS` (default 5000), `OMB_AI_GATE_MODEL`.
-- Schema validation upgrades illegal L0/L1+write classifications; audit records `classifierSource`, failure reason, elapsedMs.
-- L0/L1 runtime ops still blocked by `gate/permissions.ts` until upgraded.
+- Visible **Gate** bot (ensured on server start): Antigravity `gemini-3.8-flash-low`（轻量思考，非 High）.
+- Classification still uses lightweight `agy --print` bound to Gate bot model; routing disabled (no F_final).
+- Fallback: `server/langgraph/gate/rule-fallback.ts`.
+- Config: `OMB_AI_GATE_ENABLED`, `OMB_AI_GATE_TIMEOUT_MS` (default 8000), `OMB_AI_GATE_MODEL` (high ids are coerced to low).
+- Gate is excluded from WorkerRegistry / Momo delegate roster (infra bot, like Judge).
+- Classification cards are mirrored into Gate's own chat transcript.
 
 ## WorkerRegistry + RoutingGuard (supplement)
 

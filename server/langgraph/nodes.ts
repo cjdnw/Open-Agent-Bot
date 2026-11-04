@@ -6,6 +6,7 @@ import type {
 } from "./types.ts";
 import type { WorkflowGraphState } from "./state.ts";
 import { runAiGate } from "./gate/ai-gate.ts";
+import { isGateBotName, resolveGateModelId } from "./gate/ensure-gate-bot.ts";
 import { detectUpgradeIntentFromText, evaluateGateOperation } from "./gate/permissions.ts";
 import { globalResourceLockManager } from "./resource-lock.ts";
 import {
@@ -43,6 +44,10 @@ function isJudgeBot(name: string): boolean {
   return /^judge$/i.test(name.trim());
 }
 
+function isInfraBot(name: string): boolean {
+  return isJudgeBot(name) || isGateBotName(name);
+}
+
 /** Deterministic dependency order; cycle already rejected by RoutingGuard. */
 function topologicalAssignments(
   assignments: Array<{ role: string; objective: string; dependsOn?: string[] }>,
@@ -64,18 +69,60 @@ function topologicalAssignments(
 
 export function createWorkflowNodes(deps: WorkflowDeps) {
   return {
-    // ── 1. AI Gate (Gemini 3.8 Flash → Rule Fallback) ────────────
+    // ── 1. Gate bot (Flash Low) → Rule Fallback ──────────────────
     fastGateNode: async (state: WorkflowGraphState): Promise<Partial<WorkflowGraphState>> => {
       const taskId = state.workflowId || `gate-${Date.now().toString(36)}`;
+      const gateBot = deps.findBotByName("Gate");
+      const modelId = resolveGateModelId(
+        gateBot ? [{ name: gateBot.name, modelSelection: gateBot.modelSelection }] : [],
+      );
+
       const runGate = deps.runAiGate || runAiGate;
-      const gate = await runGate({
-        taskId,
-        userRequest: state.userRequest,
-      });
+      if (gateBot) deps.setBusy(gateBot.id, true);
+      let gate;
+      try {
+        gate = await runGate(
+          { taskId, userRequest: state.userRequest },
+          {
+            classifyWithGemini: async (req, history, opts) => {
+              const { classifyWithGeminiFlash } = await import("./gate/gemini-classifier.ts");
+              return classifyWithGeminiFlash(req, history, { ...opts, modelId });
+            },
+          },
+        );
+      } finally {
+        if (gateBot) deps.setBusy(gateBot.id, false);
+      }
 
       const isL0 = gate.routeLevel === "L0";
       const source = gate.audit.classifierSource;
-      const summary = `[AI Gate/${source}] ${gate.routeLevel}：${gate.routeReason}`;
+      const summary = `[Gate Bot/${source}] ${gate.routeLevel}：${gate.routeReason}`;
+
+      // Always mirror onto Gate bot transcript so it shows as a real Bot.
+      if (gateBot?.threadId) {
+        deps.postText(
+          gateBot.threadId,
+          [
+            `### Gate 分类`,
+            `- routeLevel：${gate.routeLevel}`,
+            `- source：${source}`,
+            `- model：${gate.audit.modelId || modelId}`,
+            `- reason：${gate.routeReason}`,
+            gate.audit.fallbackReason ? `- fallbackReason：${gate.audit.fallbackReason}` : "",
+            `- elapsedMs：${gate.audit.elapsedMs}`,
+          ]
+            .filter(Boolean)
+            .join("\n"),
+        );
+        deps.postWorkflowEvent(gateBot.threadId, {
+          runId: state.workflowId,
+          state: "FAST_GATE",
+          stage: "AI_GATE",
+          summary,
+          detail: gate.audit,
+          ok: source === "GEMINI",
+        });
+      }
 
       if (!isL0) {
         deps.postWorkflowEvent(state.threadId, {
@@ -88,6 +135,7 @@ export function createWorkflowNodes(deps: WorkflowDeps) {
             taskType: gate.taskType,
             requiresWrite: gate.requiresWrite,
             requiresFormalReview: gate.requiresFormalReview,
+            gateBotId: gateBot?.id,
           },
           ok: true,
         });
@@ -186,7 +234,7 @@ export function createWorkflowNodes(deps: WorkflowDeps) {
         summary: "Judge 前置评估开始",
       });
 
-      const team = deps.listVisibleTeam(state.momoBotId).filter((b) => !isJudgeBot(b.name));
+      const team = deps.listVisibleTeam(state.momoBotId).filter((b) => !isInfraBot(b.name));
       const canXHigh = deps.canXHighForBot(state.judgeBotId);
       const prePrompt = judgePreReviewPrompt({
         taskId: state.workflowId,
@@ -270,7 +318,7 @@ export function createWorkflowNodes(deps: WorkflowDeps) {
     workerRegistryLookupNode: async (state: WorkflowGraphState): Promise<Partial<WorkflowGraphState>> => {
       const team = deps
         .listVisibleTeam(state.momoBotId)
-        .filter((b) => !isJudgeBot(b.name))
+        .filter((b) => !isInfraBot(b.name))
         .map((b) => ({
           id: b.id,
           name: b.name,
@@ -386,7 +434,7 @@ export function createWorkflowNodes(deps: WorkflowDeps) {
           : "Momo 正在自主评估执行策略",
       });
 
-      const team = deps.listVisibleTeam(state.momoBotId).filter((b) => !isJudgeBot(b.name));
+      const team = deps.listVisibleTeam(state.momoBotId).filter((b) => !isInfraBot(b.name));
       const registryText = state.workerRegistry
         ? formatRegistryForPrompt(state.workerRegistry)
         : rosterLines(team);
@@ -659,7 +707,7 @@ export function createWorkflowNodes(deps: WorkflowDeps) {
         summary: "委派专业员工团队执行",
       });
 
-      const team = deps.listVisibleTeam(state.momoBotId).filter((b) => !isJudgeBot(b.name));
+      const team = deps.listVisibleTeam(state.momoBotId).filter((b) => !isInfraBot(b.name));
       const assignments =
         state.taskAssignments && state.taskAssignments.length > 0
           ? topologicalAssignments(state.taskAssignments)

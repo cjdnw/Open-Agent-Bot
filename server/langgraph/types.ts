@@ -92,8 +92,22 @@ export type WorkflowEventPayload = {
 };
 
 export interface WorkflowDeps {
-  findBotByName: (name: string) => { id: string; name: string; title?: string; busy?: boolean } | undefined;
-  findBotById: (id: string) => { id: string; name: string; title?: string; threadId: string; busy?: boolean } | undefined;
+  findBotByName: (name: string) => {
+    id: string;
+    name: string;
+    title?: string;
+    busy?: boolean;
+    threadId?: string;
+    modelSelection?: { instanceId: string; model: string };
+  } | undefined;
+  findBotById: (id: string) => {
+    id: string;
+    name: string;
+    title?: string;
+    threadId: string;
+    busy?: boolean;
+    modelSelection?: { instanceId: string; model: string };
+  } | undefined;
   listVisibleTeam: (exceptId: string) => Array<{ id: string; name: string; title?: string; busy?: boolean }>;
   runBotTurn: (
     botId: string,
