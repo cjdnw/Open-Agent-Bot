@@ -10,7 +10,8 @@ export function judgePreReviewPrompt(input: {
     "你是独立评审官 Judge。现在只做【任务前置评估】，不要执行任务，不要委派，不要给出最终 PASS/FAIL。",
     "必须根据任务内容真实判断难度：简单任务评 SIMPLE，中等 MODERATE，复杂 COMPLEX。禁止把所有任务都评为 COMPLEX。",
     "难度 complexity 与风险 riskLevel 分开判断：简单任务也可能是 HIGH 风险。",
-    "recommendedRoles 只是建议，不强制执行者。",
+    "recommendedRoles 只是建议，不强制执行者；不要直接调用 Worker。",
+    "可用 roleReasons 说明每个推荐角色的原因；不得自行放宽用户验收约束。",
     `reasoningRecommendation 只能是 HIGH 或 XHIGH。当前执行栈${input.canXHigh ? "可以" : "不能"}诚实支持 XHIGH；若不能支持 XHIGH，请推荐 HIGH。`,
     "acceptanceCriteria 必须可验证，并保留用户原始约束。",
     "若 riskLevel=HIGH，requiresUserAuthorization 通常应为 true。",
@@ -22,7 +23,8 @@ export function judgePreReviewPrompt(input: {
         riskLevel: "LOW|MEDIUM|HIGH",
         reasoningRecommendation: "HIGH|XHIGH",
         difficultyReason: "string",
-        recommendedRoles: ["RoleName"],
+        recommendedRoles: ["Developer", "QA"],
+        roleReasons: { Developer: "需要改代码", QA: "需要独立验证" },
         acceptanceCriteria: ["..."],
         requiredEvidence: ["..."],
         riskWarnings: ["..."],
@@ -46,25 +48,31 @@ export function momoPlanPrompt(input: {
   teamRoster: string;
   reworkRound: number;
   priorFailReason?: string;
+  workerRegistryText?: string;
+  correctionHint?: string;
 }): string {
   return [
     "你是总管 Momo。Judge 已完成前置评估。请自主决定怎么做，不要假装自己是 Judge，不要输出 PASS/FAIL/BLOCKED。",
     "当前【协作流已开启】。禁止声称「协作流已关闭 / 只能自干 / 不委派」；那是错误前提。",
-    "可选 decision：SELF（自己做）、DELEGATE（委派一个或多个员工）、ESCALATE（需要用户批准或补充信息）。",
+    "可选 executionMode/decision：SELF（自己做）、DELEGATE（委派一个或多个员工）、ESCALATE（需要用户批准或补充信息）。",
     "规则：",
-    "- SIMPLE + LOW 风险：可以 SELF。",
-    "- MODERATE / COMPLEX，或需要写代码、数据转换、部署、评测、架构设计：优先 DELEGATE，并在 delegateBotNames 填写真实员工名（如 Developer、Architect、Deploy、QA、Reporter），不要填角色长描述。",
-    "- 不要为了表现忙碌而强制委派；但也不要把本该专业员工做的活全揽给自己。",
-    "不得自行降低 Judge 标记的安全风险；若 requiresUserAuthorization=true，必须 ESCALATE。",
+    "- 可以拒绝 Judge 的员工推荐并选择 SELF，但必须说明理由。",
+    "- DELEGATE 时 selectedRoles/delegateBotNames 必须使用 Registry 中真实角色名（Architect/Developer/Deploy/QA/Reporter）。",
+    "- 可用 taskAssignments 描述多员工依赖；dependsOn 不得成环。",
+    "- 不得违反工具权限、数据授权或未完成的高风险审批。",
+    "- 若 requiresUserAuthorization=true 且尚未批准，必须 ESCALATE。",
+    input.correctionHint ? `RoutingGuard 要求修正：${input.correctionHint}` : "",
     input.reworkRound > 0
       ? `这是第 ${input.reworkRound} 轮返工。上次 Judge FAIL 原因：${input.priorFailReason || "未说明"}。`
       : "",
     "只输出 JSON：",
     JSON.stringify(
       {
-        decision: "SELF|DELEGATE|ESCALATE",
-        reason: "string",
-        delegateBotNames: ["Developer"],
+        executionMode: "SELF|DELEGATE|ESCALATE",
+        decisionReason: "string",
+        selectedRoles: ["Developer"],
+        requestedEffort: "HIGH|XHIGH",
+        taskAssignments: [{ role: "Developer", objective: "...", dependsOn: [] }],
       },
       null,
       2,
@@ -73,7 +81,10 @@ export function momoPlanPrompt(input: {
     "Judge 前置评估：",
     JSON.stringify(input.preReview, null, 2),
     "",
-    "团队（用这里的名字填 delegateBotNames）：",
+    "WorkerRegistry（实时能力与可用性）：",
+    input.workerRegistryText || input.teamRoster,
+    "",
+    "团队名录：",
     input.teamRoster,
     "",
     "用户任务：",

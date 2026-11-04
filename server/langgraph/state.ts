@@ -9,6 +9,8 @@ import type {
   RiskLevel,
   RouteLevel,
 } from "./types.ts";
+import type { RegistryLookupResult, WorkerCapability } from "./worker-registry.ts";
+import type { RoutingGuardResult, TaskAssignment } from "./routing-guard.ts";
 
 export const WorkflowStateAnnotation = Annotation.Root({
   workflowId: Annotation<string>({
@@ -158,6 +160,34 @@ export const WorkflowStateAnnotation = Annotation.Root({
   upgradeRequired: Annotation<boolean>({
     reducer: (curr, update) => update ?? curr ?? false,
     default: () => false,
+  }),
+  workerRegistry: Annotation<RegistryLookupResult | null>({
+    reducer: (curr, update) => (update !== undefined ? update : curr),
+    default: () => null,
+  }),
+  workerCapabilities: Annotation<WorkerCapability[]>({
+    reducer: (curr, update) => update ?? curr ?? [],
+    default: () => [],
+  }),
+  routingGuardResult: Annotation<RoutingGuardResult | null>({
+    reducer: (curr, update) => (update !== undefined ? update : curr),
+    default: () => null,
+  }),
+  routingRetryCount: Annotation<number>({
+    reducer: (curr, update) => (update !== undefined ? update : curr),
+    default: () => 0,
+  }),
+  routingCorrectionHint: Annotation<string>({
+    reducer: (curr, update) => update ?? curr ?? "",
+    default: () => "",
+  }),
+  taskAssignments: Annotation<TaskAssignment[]>({
+    reducer: (curr, update) => update ?? curr ?? [],
+    default: () => [],
+  }),
+  routingSource: Annotation<"MOMO" | "ROUTING_GUARD" | "">({
+    reducer: (curr, update) => update ?? curr ?? "",
+    default: () => "",
   }),
 });
 

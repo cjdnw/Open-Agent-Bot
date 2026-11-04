@@ -53,6 +53,13 @@ Existing `workflow:*` stage cards in ChatView show Fast Gate / Pre-Review / Plan
 
 `server/langgraph/langgraph-workflow.test.ts` — Fast Gate matrix, Judge pre/final, SELF/DELEGATE edges, rework cap, cancel, interrupt/resume, 100× mock L0/L1 stress.
 
+## WorkerRegistry + RoutingGuard (supplement)
+
+- `server/langgraph/worker-registry.ts` — live botId binding, capability catalog, availability, tool/ops matching with audit `matchReasons`.
+- `server/langgraph/routing-guard.ts` — deterministic validation: SELF allowed despite Judge roles; DELEGATE existence/availability/tools/cycles; one Momo retry; then recorded `routingSource: ROUTING_GUARD` fallback / ESCALATE / BLOCKED.
+- Graph path: Judge Pre-Review → WorkerRegistry → Momo → RoutingGuard → Executor → Judge Final. L0/L1 skip registry scheduling.
+- Model Fallback remains inside each bot's `runBotTurn`; RoutingGuard never swaps workers because a model failed.
+
 ## Known limits
 
 - Real paid-provider E2E depends on local CLI/API credentials; CI uses mocks.

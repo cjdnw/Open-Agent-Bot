@@ -8,48 +8,48 @@ export function buildLangGraphWorkflow(deps: WorkflowDeps, checkpointer?: BaseCh
   const nodes = createWorkflowNodes(deps);
 
   const graph = new StateGraph(WorkflowStateAnnotation)
-    // 1. Register Nodes
     .addNode("fastGateStep", nodes.fastGateNode)
     .addNode("momoFastChatStep", nodes.momoFastChatNode)
     .addNode("momoLightStep", nodes.momoLightNode)
     .addNode("judgePreReviewStep", nodes.judgePreReviewNode)
+    .addNode("workerRegistryLookupStep", nodes.workerRegistryLookupNode)
     .addNode("humanApprovalStep", nodes.humanApprovalNode)
     .addNode("momoPlannerStep", nodes.momoPlannerNode)
+    .addNode("routingGuardStep", nodes.routingGuardNode)
     .addNode("momoExecutorStep", nodes.momoExecutorNode)
     .addNode("workerDispatcherStep", nodes.workerDispatcherNode)
     .addNode("judgeFinalReviewStep", nodes.judgeFinalReviewNode)
     .addNode("reworkStep", nodes.reworkNode)
     .addNode("momoDeliveryStep", nodes.momoDeliveryNode)
 
-    // 2. Fixed Edge: START → fastGateStep
     .addEdge(START, "fastGateStep")
 
-    // 3. Conditional Edge: fastGateStep
     .addConditionalEdges("fastGateStep", (state: WorkflowGraphState) => {
       if (state.routeLevel === "L0") return "momoFastChatStep";
       if (state.routeLevel === "L1") return "momoLightStep";
       return "judgePreReviewStep";
     })
 
-    // 4. Fixed Edge: momoFastChatStep → END
     .addEdge("momoFastChatStep", END)
 
-    // 5. Conditional Edge: momoLightStep
     .addConditionalEdges("momoLightStep", (state: WorkflowGraphState) => {
       if (state.upgradeRequired) return "judgePreReviewStep";
       return END;
     })
 
-    // 6. Conditional Edge: judgePreReviewStep
+    // Judge → WorkerRegistry (never skip registry on formal path)
     .addConditionalEdges("judgePreReviewStep", (state: WorkflowGraphState) => {
       if (state.executionStatus === "BLOCKED" || state.errors.length > 0) return END;
+      return "workerRegistryLookupStep";
+    })
+
+    .addConditionalEdges("workerRegistryLookupStep", (state: WorkflowGraphState) => {
       if (state.requiresHumanApproval && state.approvalGranted !== true) {
         return "humanApprovalStep";
       }
       return "momoPlannerStep";
     })
 
-    // 7. Conditional Edge: humanApprovalStep (after interrupt resume)
     .addConditionalEdges("humanApprovalStep", (state: WorkflowGraphState) => {
       if (state.approvalGranted === true && state.executionStatus !== "CANCELLED") {
         return "momoPlannerStep";
@@ -57,19 +57,24 @@ export function buildLangGraphWorkflow(deps: WorkflowDeps, checkpointer?: BaseCh
       return END;
     })
 
-    // 8. Conditional Edge: momoPlannerStep
-    .addConditionalEdges("momoPlannerStep", (state: WorkflowGraphState) => {
-      if (state.executionStatus === "FAILED" || state.errors.length > 0) return END;
-      if (state.executionMode === "ESCALATE") return "humanApprovalStep";
+    // Momo decision always validated by RoutingGuard
+    .addEdge("momoPlannerStep", "routingGuardStep")
+
+    .addConditionalEdges("routingGuardStep", (state: WorkflowGraphState) => {
+      const guard = state.routingGuardResult;
+      if (!guard) return END;
+      if (guard.retryRequested) return "momoPlannerStep";
+      if (guard.status === "BLOCKED" || guard.status === "INVALID") return END;
+      if (guard.status === "ESCALATE" || state.executionMode === "ESCALATE") {
+        return "humanApprovalStep";
+      }
       if (state.executionMode === "DELEGATE") return "workerDispatcherStep";
       return "momoExecutorStep";
     })
 
-    // 9. Fixed Edges to Final Review
     .addEdge("momoExecutorStep", "judgeFinalReviewStep")
     .addEdge("workerDispatcherStep", "judgeFinalReviewStep")
 
-    // 10. Conditional Edge: judgeFinalReviewStep
     .addConditionalEdges("judgeFinalReviewStep", (state: WorkflowGraphState) => {
       if (state.judgeFinalVerdict === "PASS") return "momoDeliveryStep";
       if (state.judgeFinalVerdict === "FAIL") {
@@ -78,13 +83,10 @@ export function buildLangGraphWorkflow(deps: WorkflowDeps, checkpointer?: BaseCh
         }
         return END;
       }
-      return END; // BLOCKED or error
+      return END;
     })
 
-    // 11. Edge: reworkStep → momoPlannerStep
     .addEdge("reworkStep", "momoPlannerStep")
-
-    // 12. Edge: momoDeliveryStep → END
     .addEdge("momoDeliveryStep", END);
 
   return checkpointer ? graph.compile({ checkpointer }) : graph.compile();

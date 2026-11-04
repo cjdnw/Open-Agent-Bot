@@ -37,6 +37,8 @@ export interface PreReview {
   reasoningEffective: ReasoningRecommendation;
   difficultyReason: string;
   recommendedRoles: string[];
+  /** Optional per-role recommendation rationale from Judge. */
+  roleReasons?: Record<string, string>;
   acceptanceCriteria: string[];
   requiredEvidence: string[];
   riskWarnings: string[];
@@ -45,10 +47,18 @@ export interface PreReview {
   at: number;
 }
 
+export interface MomoTaskAssignment {
+  role: string;
+  objective: string;
+  dependsOn?: string[];
+}
+
 export interface MomoPlan {
   decision: MomoDecisionKind;
   reason: string;
   delegateBotNames: string[];
+  requestedEffort?: "HIGH" | "XHIGH";
+  taskAssignments?: MomoTaskAssignment[];
   at: number;
 }
 
@@ -173,6 +183,15 @@ export function parsePreReview(text: string, taskId: string, canXHigh: boolean):
   const requiresUserAuthorization =
     obj.requiresUserAuthorization === true ||
     (riskLevel === "HIGH" && obj.requiresUserAuthorization !== false);
+  let roleReasons: Record<string, string> | undefined;
+  if (obj.roleReasons && typeof obj.roleReasons === "object" && !Array.isArray(obj.roleReasons)) {
+    roleReasons = {};
+    for (const [k, v] of Object.entries(obj.roleReasons as Record<string, unknown>)) {
+      const reason = String(v || "").trim();
+      if (k.trim() && reason) roleReasons[k.trim()] = reason;
+    }
+    if (Object.keys(roleReasons).length === 0) roleReasons = undefined;
+  }
   return {
     taskId: String(obj.taskId || taskId),
     complexity: complexity as Complexity,
@@ -181,6 +200,7 @@ export function parsePreReview(text: string, taskId: string, canXHigh: boolean):
     reasoningEffective: effective,
     difficultyReason: String(obj.difficultyReason || "").trim() || "unspecified",
     recommendedRoles: recommended,
+    roleReasons,
     acceptanceCriteria: criteria,
     requiredEvidence: asStringArray(obj.requiredEvidence),
     riskWarnings: asStringArray(obj.riskWarnings),
@@ -193,12 +213,37 @@ export function parsePreReview(text: string, taskId: string, canXHigh: boolean):
 export function parseMomoPlan(text: string): MomoPlan | null {
   const obj = extractJsonObject(text) as Record<string, unknown> | null;
   if (!obj) return null;
-  const decision = String(obj.decision || "").toUpperCase();
+  const decision = String(obj.decision || obj.executionMode || "").toUpperCase();
   if (decision !== "SELF" && decision !== "DELEGATE" && decision !== "ESCALATE") return null;
+  const roles = asStringArray(
+    obj.delegateBotNames || obj.selectedRoles || obj.delegateTo || obj.workers,
+  );
+  let requestedEffort: "HIGH" | "XHIGH" | undefined;
+  const effort = String(obj.requestedEffort || "").toUpperCase();
+  if (effort === "HIGH" || effort === "XHIGH") requestedEffort = effort;
+  let taskAssignments: MomoTaskAssignment[] | undefined;
+  if (Array.isArray(obj.taskAssignments)) {
+    const parsed: MomoTaskAssignment[] = [];
+    for (const item of obj.taskAssignments) {
+      if (!item || typeof item !== "object") continue;
+      const rec = item as Record<string, unknown>;
+      const role = String(rec.role || "").trim();
+      if (!role) continue;
+      const dependsOn = asStringArray(rec.dependsOn);
+      parsed.push({
+        role,
+        objective: String(rec.objective || "").trim() || "unspecified",
+        ...(dependsOn.length ? { dependsOn } : {}),
+      });
+    }
+    if (parsed.length > 0) taskAssignments = parsed;
+  }
   return {
     decision: decision as MomoDecisionKind,
-    reason: String(obj.reason || "").trim() || "unspecified",
-    delegateBotNames: asStringArray(obj.delegateBotNames || obj.delegateTo || obj.workers),
+    reason: String(obj.reason || obj.decisionReason || "").trim() || "unspecified",
+    delegateBotNames: roles,
+    requestedEffort,
+    taskAssignments,
     at: Date.now(),
   };
 }

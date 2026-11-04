@@ -8,6 +8,15 @@ import type { WorkflowGraphState } from "./state.ts";
 import { evaluateFastGate } from "./fast-gate.ts";
 import { globalResourceLockManager } from "./resource-lock.ts";
 import {
+  formatRegistryForPrompt,
+  lookupWorkersForTask,
+} from "./worker-registry.ts";
+import {
+  momoPlanToRoutingDecision,
+  routingGuardToMomoPlan,
+  validateMomoRouting,
+} from "./routing-guard.ts";
+import {
   parseFinalReview,
   parseMomoPlan,
   parsePreReview,
@@ -31,6 +40,25 @@ function rosterLines(team: Array<{ name: string; title?: string }>): string {
 
 function isJudgeBot(name: string): boolean {
   return /^judge$/i.test(name.trim());
+}
+
+/** Deterministic dependency order; cycle already rejected by RoutingGuard. */
+function topologicalAssignments(
+  assignments: Array<{ role: string; objective: string; dependsOn?: string[] }>,
+): Array<{ role: string; objective: string; dependsOn?: string[] }> {
+  const byRole = new Map(assignments.map((a) => [a.role, a]));
+  const result: typeof assignments = [];
+  const seen = new Set<string>();
+  const visit = (role: string) => {
+    if (seen.has(role)) return;
+    seen.add(role);
+    const node = byRole.get(role);
+    if (!node) return;
+    for (const dep of node.dependsOn || []) visit(dep);
+    result.push(node);
+  };
+  for (const a of assignments) visit(a.role);
+  return result;
 }
 
 export function createWorkflowNodes(deps: WorkflowDeps) {
@@ -188,6 +216,9 @@ export function createWorkflowNodes(deps: WorkflowDeps) {
           `- 需要用户授权：${requiresAuth ? "是" : "否"}`,
           `- 原因：${pre.difficultyReason}`,
           `- 建议角色：${pre.recommendedRoles.join(", ") || "无"}`,
+          ...(pre.roleReasons
+            ? Object.entries(pre.roleReasons).map(([role, reason]) => `  - ${role}：${reason}`)
+            : []),
           `- 验收标准：`,
           ...pre.acceptanceCriteria.map((c) => `  - ${c}`),
           `- 所需证据：`,
@@ -207,6 +238,54 @@ export function createWorkflowNodes(deps: WorkflowDeps) {
         requiresHumanApproval: requiresAuth,
         criteriaVersion: lockedCriteriaVersion,
         history: [{ state: "PRE_REVIEW_DONE", at: Date.now(), note: `Locked criteria version: ${lockedCriteriaVersion}` }],
+      };
+    },
+
+    // ── 4b. WorkerRegistry lookup (after Judge, before Momo) ─────
+    workerRegistryLookupNode: async (state: WorkflowGraphState): Promise<Partial<WorkflowGraphState>> => {
+      const team = deps
+        .listVisibleTeam(state.momoBotId)
+        .filter((b) => !isJudgeBot(b.name))
+        .map((b) => ({
+          id: b.id,
+          name: b.name,
+          title: b.title,
+          busy: b.busy,
+        }));
+
+      const lookup = lookupWorkersForTask(
+        team,
+        state.userRequest,
+        state.judgePreReview?.recommendedRoles || [],
+        state.riskLevel,
+      );
+
+      deps.postWorkflowEvent(state.threadId, {
+        runId: state.workflowId,
+        state: "PLANNING",
+        stage: "WORKER_REGISTRY",
+        summary: `WorkerRegistry：${lookup.workers.length} 名员工；Judge 推荐 ${state.judgePreReview?.recommendedRoles.join(", ") || "无"}`,
+        detail: {
+          workers: lookup.workers.map((w) => ({
+            role: w.role,
+            botId: w.botId,
+            availability: w.availability,
+          })),
+          matchReasons: lookup.matchReasons.slice(0, 8),
+        },
+        ok: true,
+      });
+
+      return {
+        workerRegistry: lookup,
+        workerCapabilities: lookup.workers,
+        history: [
+          {
+            state: "WORKER_REGISTRY",
+            at: Date.now(),
+            note: `workers=${lookup.workers.length}`,
+          },
+        ],
       };
     },
 
@@ -272,62 +351,62 @@ export function createWorkflowNodes(deps: WorkflowDeps) {
 
     // ── 6. Momo Planner Node ─────────────────────────────────────
     momoPlannerNode: async (state: WorkflowGraphState): Promise<Partial<WorkflowGraphState>> => {
+      const isRetry = state.routingRetryCount > 0;
       deps.postWorkflowEvent(state.threadId, {
         runId: state.workflowId,
         state: "PLANNING",
-        stage: "PLANNING",
-        summary: "Momo 正在自主评估执行策略",
+        stage: isRetry ? "MOMO_RETRY" : "PLANNING",
+        summary: isRetry
+          ? `Momo 修正决策（${state.routingRetryCount}/1）`
+          : "Momo 正在自主评估执行策略",
       });
 
       const team = deps.listVisibleTeam(state.momoBotId).filter((b) => !isJudgeBot(b.name));
+      const registryText = state.workerRegistry
+        ? formatRegistryForPrompt(state.workerRegistry)
+        : rosterLines(team);
+
       const planPrompt = momoPlanPrompt({
         userRequest: state.userRequest,
         preReview: state.judgePreReview!,
         teamRoster: rosterLines(team),
         reworkRound: state.reworkCount,
         priorFailReason: state.judgeFinalReview?.reason,
+        workerRegistryText: registryText,
+        correctionHint: state.routingCorrectionHint || undefined,
       });
 
       const planTurn = await deps.runBotTurn(state.momoBotId, planPrompt, {
         reasoningEffort: state.reasoningEffective === "XHIGH" ? "xhigh" : "high",
-        label: "momo-plan",
+        label: isRetry ? "momo-plan-retry" : "momo-plan",
       });
 
-      let plan = parseMomoPlan(planTurn.text);
-      if (!planTurn.ok || !plan) {
-        if (state.complexity === "SIMPLE" && planTurn.ok) {
-          plan = { decision: "SELF", reason: "解析回退：简单任务 Momo 自行完成", delegateBotNames: [], at: Date.now() };
-        } else {
-          const err = planTurn.error || "Momo 未返回可解析的执行决策 JSON";
-          deps.postWorkflowEvent(state.threadId, {
-            runId: state.workflowId,
-            state: "FAILED",
-            stage: "PLAN_FAIL",
-            summary: err,
-            ok: false,
-          });
-          return {
-            executionStatus: "FAILED",
-            errors: [err],
-            history: [{ state: "PLAN_FAILED", at: Date.now(), note: err }],
-          };
-        }
-      }
+      let plan = planTurn.ok ? parseMomoPlan(planTurn.text) : null;
 
-      // Safety: Cannot choose SELF to bypass human authorization requirement
-      if (state.requiresHumanApproval && !state.approvalGranted && plan.decision !== "ESCALATE") {
+      // Soft-normalize false solo excuses; RoutingGuard still owns validity.
+      if (plan?.decision === "SELF" && /协作流已关闭|只能自干/.test(plan.reason)) {
         plan = {
           ...plan,
-          decision: "ESCALATE",
-          reason: `强制 ESCALATE：前置评估要求人工授权，当前未授权。原决策 ${plan.decision} 覆盖。`,
+          reason: "协作流已开启，Momo 确认独立执行该模块",
         };
       }
 
-      // Guard against false claims like "协作流已关闭" when collaboration is actually on
-      if (plan.decision === "SELF" && /协作流已关闭|只能自干/.test(plan.reason)) {
-        plan = {
-          ...plan,
-          reason: `协作流已开启，Momo 确认独立执行该模块`,
+      if (!plan) {
+        deps.postWorkflowEvent(state.threadId, {
+          runId: state.workflowId,
+          state: "PLANNING",
+          stage: "PLAN_INVALID",
+          summary: "INVALID：未返回有效 executionMode / 决策 JSON",
+          detail: { raw: planTurn.text.slice(0, 600), error: planTurn.error },
+          ok: false,
+        });
+        deps.postText(
+          state.threadId,
+          "### Momo Decision\nINVALID：未返回有效结构化决策（交由 RoutingGuard 处理）",
+        );
+        return {
+          momoDecision: null,
+          history: [{ state: "PLAN_INVALID", at: Date.now(), note: planTurn.error || "unparseable" }],
         };
       }
 
@@ -343,10 +422,15 @@ export function createWorkflowNodes(deps: WorkflowDeps) {
       deps.postText(
         state.threadId,
         [
-          "### Momo 执行决策",
-          `- 决策：${plan.decision}`,
+          "### Momo Decision",
+          `- executionMode：${plan.decision}`,
           `- 理由：${plan.reason}`,
-          plan.decision === "DELEGATE" ? `- 委派员工：${plan.delegateBotNames.join(", ") || "按建议角色分配"}` : "",
+          plan.decision === "DELEGATE"
+            ? `- selectedRoles：${plan.delegateBotNames.join(", ") || "（空）"}`
+            : "",
+          state.judgePreReview?.recommendedRoles?.length
+            ? `- Judge 推荐：${state.judgePreReview.recommendedRoles.join(", ")}`
+            : "",
         ]
           .filter(Boolean)
           .join("\n"),
@@ -354,9 +438,115 @@ export function createWorkflowNodes(deps: WorkflowDeps) {
 
       return {
         momoDecision: plan,
-        executionMode: plan.decision,
-        selectedBots: plan.delegateBotNames,
         history: [{ state: "PLAN_DONE", at: Date.now(), note: `Decision: ${plan.decision}` }],
+      };
+    },
+
+    // ── 6b. RoutingGuard — validate / retry / deterministic fallback ─
+    routingGuardNode: async (state: WorkflowGraphState): Promise<Partial<WorkflowGraphState>> => {
+      const registry = state.workerRegistry || {
+        workers: state.workerCapabilities || [],
+        matchReasons: [],
+        at: Date.now(),
+      };
+
+      const decision = momoPlanToRoutingDecision(state.momoDecision);
+      const result = validateMomoRouting({
+        decision,
+        preReview: state.judgePreReview!,
+        registry,
+        userRequest: state.userRequest,
+        approvalGranted: state.approvalGranted,
+        retryCount: state.routingRetryCount,
+      });
+
+      deps.postWorkflowEvent(state.threadId, {
+        runId: state.workflowId,
+        state:
+          result.status === "BLOCKED"
+            ? "BLOCKED"
+            : result.status === "ESCALATE"
+              ? "WAITING_APPROVAL"
+              : "PLANNING",
+        stage: "ROUTING_GUARD",
+        summary: `RoutingGuard ${result.status}${result.fallbackApplied ? "（兜底）" : ""}：${result.reason}`,
+        detail: result,
+        ok: result.status === "VALID" || result.status === "FALLBACK",
+      });
+
+      if (result.retryRequested) {
+        deps.postText(
+          state.threadId,
+          `### RoutingGuard\nINVALID / RETRY（${state.routingRetryCount + 1}/1）\n原因：${result.reason}`,
+        );
+        return {
+          routingGuardResult: result,
+          routingRetryCount: state.routingRetryCount + 1,
+          routingCorrectionHint: result.reason,
+          history: [{ state: "ROUTING_RETRY", at: Date.now(), note: result.reason }],
+        };
+      }
+
+      if (result.status === "BLOCKED" || result.status === "INVALID") {
+        deps.postText(state.threadId, `### RoutingGuard\nBLOCKED\n${result.reason}`);
+        return {
+          routingGuardResult: result,
+          executionStatus: "BLOCKED",
+          routingSource: result.routingSource,
+          errors: [result.reason],
+          history: [{ state: "BLOCKED", at: Date.now(), note: result.reason }],
+        };
+      }
+
+      if (result.status === "ESCALATE") {
+        deps.postText(state.threadId, `### RoutingGuard\nESCALATE\n${result.reason}`);
+        return {
+          routingGuardResult: result,
+          executionMode: "ESCALATE",
+          requiresHumanApproval: true,
+          pendingApproval: true,
+          routingSource: result.routingSource,
+          history: [{ state: "ROUTING_ESCALATE", at: Date.now(), note: result.reason }],
+        };
+      }
+
+      const plan = routingGuardToMomoPlan(result);
+      const executorLabel =
+        result.executionMode === "SELF"
+          ? "Momo"
+          : result.resolvedWorkers.map((w) => w.name).join(", ") || result.selectedRoles.join(", ");
+
+      deps.postText(
+        state.threadId,
+        [
+          "### RoutingGuard",
+          `- 状态：${result.status}`,
+          `- routingSource：${result.routingSource}`,
+          `- fallbackApplied：${result.fallbackApplied ? "true" : "false"}`,
+          `- executionMode：${result.executionMode}`,
+          result.selectedRoles.length ? `- selectedRoles：${result.selectedRoles.join(", ")}` : "",
+          `- Executor：${executorLabel}`,
+          `- 原因：${result.reason}`,
+        ]
+          .filter(Boolean)
+          .join("\n"),
+      );
+
+      return {
+        routingGuardResult: result,
+        momoDecision: plan,
+        executionMode: result.executionMode || "SELF",
+        selectedBots: result.selectedRoles,
+        taskAssignments: result.taskAssignments,
+        routingSource: result.routingSource,
+        routingCorrectionHint: "",
+        history: [
+          {
+            state: "ROUTING_GUARD",
+            at: Date.now(),
+            note: `${result.status}/${result.routingSource}/${result.executionMode}`,
+          },
+        ],
       };
     },
 
@@ -445,14 +635,31 @@ export function createWorkflowNodes(deps: WorkflowDeps) {
       });
 
       const team = deps.listVisibleTeam(state.momoBotId).filter((b) => !isJudgeBot(b.name));
-      const requestedNames =
-        state.selectedBots && state.selectedBots.length > 0
-          ? state.selectedBots
-          : state.judgePreReview?.recommendedRoles || [];
+      const assignments =
+        state.taskAssignments && state.taskAssignments.length > 0
+          ? topologicalAssignments(state.taskAssignments)
+          : (state.selectedBots || []).map((role) => ({ role, objective: state.userRequest }));
 
-      // Match worker bots
+      const requestedNames =
+        assignments.length > 0
+          ? assignments.map((a) => a.role)
+          : state.selectedBots && state.selectedBots.length > 0
+            ? state.selectedBots
+            : state.judgePreReview?.recommendedRoles || [];
+
+      // Prefer RoutingGuard-resolved botIds when present
+      const resolvedIds = new Map(
+        (state.routingGuardResult?.resolvedWorkers || []).map((w) => [w.role.toLowerCase(), w.botId]),
+      );
+
       const workers = requestedNames
         .map((name) => {
+          const roleKey = name.toLowerCase().trim();
+          const resolvedId = resolvedIds.get(roleKey);
+          if (resolvedId) {
+            const byId = team.find((b) => b.id === resolvedId);
+            if (byId) return byId;
+          }
           const lower = name.toLowerCase().trim();
           return team.find(
             (b) =>
@@ -681,6 +888,9 @@ export function createWorkflowNodes(deps: WorkflowDeps) {
 
       return {
         reworkCount: nextRework,
+        routingRetryCount: 0,
+        routingCorrectionHint: "",
+        routingGuardResult: null,
         history: [{ state: "REWORK", at: Date.now(), note }],
       };
     },
