@@ -28,6 +28,8 @@ export interface FastGateResult {
   suggestedRiskLevel: RiskLevel;
 }
 
+export type { GateResult, GateAuditRecord } from "./gate/types.ts";
+
 import type {
   PreReview as CorePreReview,
   MomoPlan as CoreMomoPlan,
@@ -104,4 +106,10 @@ export interface WorkflowDeps {
   setBusy: (botId: string, busy: boolean) => void;
   interruptBot?: (botId: string) => Promise<void> | void;
   persistRun?: (run: WorkflowRun) => void;
+  /** Injectable AI Gate (tests / force rule-only). Default: Gemini→Rule. */
+  runAiGate?: (input: {
+    taskId: string;
+    userRequest: string;
+    history?: Array<{ role: "user" | "assistant" | "system"; text: string }>;
+  }) => Promise<import("./gate/types.ts").GateResult>;
 }

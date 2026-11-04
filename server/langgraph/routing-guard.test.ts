@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+process.env.OMB_AI_GATE_ENABLED = "false";
 import { buildLangGraphWorkflow } from "./graph.ts";
 import {
   detectDependencyCycle,

@@ -5,7 +5,8 @@ import type {
   WorkflowDeps,
 } from "./types.ts";
 import type { WorkflowGraphState } from "./state.ts";
-import { evaluateFastGate } from "./fast-gate.ts";
+import { runAiGate } from "./gate/ai-gate.ts";
+import { detectUpgradeIntentFromText, evaluateGateOperation } from "./gate/permissions.ts";
 import { globalResourceLockManager } from "./resource-lock.ts";
 import {
   formatRegistryForPrompt,
@@ -63,19 +64,31 @@ function topologicalAssignments(
 
 export function createWorkflowNodes(deps: WorkflowDeps) {
   return {
-    // ── 1. Fast Gate ─────────────────────────────────────────────
+    // ── 1. AI Gate (Gemini 3.8 Flash → Rule Fallback) ────────────
     fastGateNode: async (state: WorkflowGraphState): Promise<Partial<WorkflowGraphState>> => {
-      const gate = evaluateFastGate(state.userRequest);
-      const isL0 = gate.routeLevel === "L0";
+      const taskId = state.workflowId || `gate-${Date.now().toString(36)}`;
+      const runGate = deps.runAiGate || runAiGate;
+      const gate = await runGate({
+        taskId,
+        userRequest: state.userRequest,
+      });
 
-      // Emit UI card for formal tasks (L1, L2, L3)
+      const isL0 = gate.routeLevel === "L0";
+      const source = gate.audit.classifierSource;
+      const summary = `[AI Gate/${source}] ${gate.routeLevel}：${gate.routeReason}`;
+
       if (!isL0) {
         deps.postWorkflowEvent(state.threadId, {
           runId: state.workflowId,
           state: "FAST_GATE",
-          stage: "FAST_GATE",
-          summary: `[Fast Gate] ${gate.routeLevel}：${gate.routeReason}`,
-          detail: gate,
+          stage: "AI_GATE",
+          summary,
+          detail: {
+            ...gate.audit,
+            taskType: gate.taskType,
+            requiresWrite: gate.requiresWrite,
+            requiresFormalReview: gate.requiresFormalReview,
+          },
           ok: true,
         });
       }
@@ -86,11 +99,14 @@ export function createWorkflowNodes(deps: WorkflowDeps) {
         judgeRequired: gate.judgeRequired,
         complexity: gate.suggestedComplexity,
         riskLevel: gate.suggestedRiskLevel,
+        requiresHumanApproval: gate.requiresHumanApproval || gate.routeLevel === "L3",
+        requiresWrite: gate.requiresWrite,
+        gateAudit: gate.audit,
         history: [
           {
-            state: "FAST_GATE",
+            state: "AI_GATE",
             at: Date.now(),
-            note: `${gate.routeLevel}: ${gate.routeReason}`,
+            note: `${gate.routeLevel}/${source}: ${gate.routeReason}`,
           },
         ],
       };
@@ -122,21 +138,30 @@ export function createWorkflowNodes(deps: WorkflowDeps) {
         label: "momo-light-task",
       });
 
-      const needsUpgrade = turn.text.includes("[NEED_UPGRADE]") || /(修改文件|写入磁盘|远程部署|生产服务)/i.test(turn.text);
+      const intentOp = detectUpgradeIntentFromText(turn.text) || detectUpgradeIntentFromText(state.userRequest);
+      const perm = intentOp
+        ? evaluateGateOperation(state.routeLevel || "L1", intentOp)
+        : { allowed: true, reason: "no upgrade intent" };
+      const needsUpgrade =
+        turn.text.includes("[NEED_UPGRADE]") ||
+        !perm.allowed ||
+        /(修改文件|写入磁盘|远程部署|生产服务)/i.test(turn.text);
 
       if (needsUpgrade) {
+        const upgradeTo = perm.upgradeTo || "L2";
         deps.postWorkflowEvent(state.threadId, {
           runId: state.workflowId,
           state: "FAST_GATE",
           stage: "UPGRADE",
-          summary: "L1 检测到写操作或正式交付需求，安全升级至 L2 正式评审工作流",
+          summary: `L1 检测到写/外部操作，升级至 ${upgradeTo}（${perm.reason}）`,
           ok: true,
         });
         return {
           upgradeRequired: true,
-          routeLevel: "L2",
+          routeLevel: upgradeTo,
           judgeRequired: true,
-          history: [{ state: "UPGRADED_TO_L2", at: Date.now(), note: "Upgraded from L1 to L2" }],
+          requiresHumanApproval: upgradeTo === "L3",
+          history: [{ state: `UPGRADED_TO_${upgradeTo}`, at: Date.now(), note: perm.reason }],
         };
       }
 

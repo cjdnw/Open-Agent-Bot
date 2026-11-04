@@ -3,6 +3,9 @@ import { join } from "node:path";
 import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { evaluateFastGate } from "./fast-gate.ts";
+
+// Unit suite uses Rule Fallback only — real Gemini covered in ai-gate.test + manual probe.
+process.env.OMB_AI_GATE_ENABLED = "false";
 import { FileCheckpointSaver } from "./checkpointer.ts";
 import { globalResourceLockManager } from "./resource-lock.ts";
 import { buildLangGraphWorkflow } from "./graph.ts";
@@ -143,7 +146,7 @@ describe("B. Judge Pre-Review & LangGraph Flow", () => {
     }
 
     expect(judgeCallCount).toBe(2); // 1 for Pre-Review, 1 for Final Review
-    expect(events).toContain("FAST_GATE");
+    expect(events).toContain("AI_GATE");
     expect(events).toContain("PRE_REVIEW");
     expect(events).toContain("PLAN_DONE");
     expect(events).toContain("EXECUTING");

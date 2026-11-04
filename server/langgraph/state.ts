@@ -11,6 +11,7 @@ import type {
 } from "./types.ts";
 import type { RegistryLookupResult, WorkerCapability } from "./worker-registry.ts";
 import type { RoutingGuardResult, TaskAssignment } from "./routing-guard.ts";
+import type { GateAuditRecord } from "./gate/types.ts";
 
 export const WorkflowStateAnnotation = Annotation.Root({
   workflowId: Annotation<string>({
@@ -188,6 +189,14 @@ export const WorkflowStateAnnotation = Annotation.Root({
   routingSource: Annotation<"MOMO" | "ROUTING_GUARD" | "">({
     reducer: (curr, update) => update ?? curr ?? "",
     default: () => "",
+  }),
+  gateAudit: Annotation<GateAuditRecord | null>({
+    reducer: (curr, update) => (update !== undefined ? update : curr),
+    default: () => null,
+  }),
+  requiresWrite: Annotation<boolean>({
+    reducer: (curr, update) => update ?? curr ?? false,
+    default: () => false,
   }),
 });
 
